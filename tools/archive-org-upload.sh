@@ -70,19 +70,65 @@ else
   log "Torrent download complete."
 fi
 
-# ─── Step 3: Find image root ────────────────────────────────────────
-log "=== Step 3: Locate image files ==="
-IMG_ROOT=$(find "$TORRENT_DIR" -type d -name "image" 2>/dev/null | head -1 || true)
-if [ -z "$IMG_ROOT" ]; then
-  IMG_ROOT=$(find "$TORRENT_DIR" -maxdepth 2 -type d 2>/dev/null | head -1)
+# ─── Step 3: Extract .car archives if present ───────────────────────
+log "=== Step 3: Extract .car archives ==="
+EXTRACT_DIR="$WORK/extracted"
+CAR_COUNT=$(find "$TORRENT_DIR" -name "*.car" -type f 2>/dev/null | wc -l)
+
+if [ "$CAR_COUNT" -gt 0 ]; then
+  if [ -f "$WORK/.extract-done" ]; then
+    log "Already extracted, skipping."
+  else
+    log "Found $CAR_COUNT .car files. Installing extractor..."
+    sudo apt-get install -y -qq golang-go
+    GOBIN="$WORK/gobin" go install github.com/ipld/go-car/cmd/car@latest 2>/dev/null || \
+    GOBIN="$WORK/gobin" go install github.com/ipld/go-car/v2/cmd/car@latest 2>/dev/null || true
+    CAR_BIN="$WORK/gobin/car"
+
+    if [ ! -x "$CAR_BIN" ]; then
+      log "go-car install failed, trying npm ipfs-car..."
+      sudo apt-get install -y -qq nodejs npm
+      npm install -g ipfs-car 2>/dev/null || true
+      CAR_BIN=""
+    fi
+
+    mkdir -p "$EXTRACT_DIR"
+    EXTRACTED=0
+    while IFS= read -r -d '' carfile; do
+      if [ -n "$CAR_BIN" ] && [ -x "$CAR_BIN" ]; then
+        "$CAR_BIN" extract -f "$carfile" "$EXTRACT_DIR" 2>/dev/null || \
+        "$CAR_BIN" extract --file "$carfile" --output-dir "$EXTRACT_DIR" 2>/dev/null || \
+        "$CAR_BIN" extract "$carfile" "$EXTRACT_DIR" 2>/dev/null || true
+      else
+        ipfs-car unpack "$carfile" --output "$EXTRACT_DIR" 2>/dev/null || true
+      fi
+      EXTRACTED=$((EXTRACTED + 1))
+      [ $((EXTRACTED % 25)) -eq 0 ] && log "  extracted $EXTRACTED / $CAR_COUNT .car files..."
+    done < <(find "$TORRENT_DIR" -name "*.car" -type f -print0 | sort -z)
+
+    EXTRACTED_COUNT=$(find "$EXTRACT_DIR" -type f 2>/dev/null | wc -l)
+    log "Extraction complete: $EXTRACTED .car files → $EXTRACTED_COUNT files."
+    touch "$WORK/.extract-done"
+  fi
+fi
+
+# ─── Step 4: Find image root ────────────────────────────────────────
+log "=== Step 4: Locate image files ==="
+# Prefer extracted .car contents, fall back to raw torrent files
+if [ -d "$EXTRACT_DIR" ] && [ "$(find "$EXTRACT_DIR" -type f | head -1)" ]; then
+  IMG_ROOT="$EXTRACT_DIR"
+  log "Using extracted .car contents."
+else
+  IMG_ROOT=$(find "$TORRENT_DIR" -type d -name "image" 2>/dev/null | head -1 || true)
+  [ -z "$IMG_ROOT" ] && IMG_ROOT=$(find "$TORRENT_DIR" -maxdepth 2 -type d 2>/dev/null | head -1)
 fi
 log "Image root: $IMG_ROOT"
 
 TOTAL=$(find "$IMG_ROOT" -type f \( -name "*.jpg" -o -name "*.jpeg" -o -name "*.png" -o -name "*.gif" -o -name "*.webm" -o -name "*.webp" \) | wc -l)
 log "Found $TOTAL image files."
 
-# ─── Step 4: Sort into year-month buckets ────────────────────────────
-log "=== Step 4: Sort into year-month buckets ==="
+# ─── Step 5: Sort into year-month buckets ────────────────────────────
+log "=== Step 5: Sort into year-month buckets ==="
 if [ -f "$WORK/.sort-done" ]; then
   log "Already sorted, skipping."
 else
@@ -109,8 +155,8 @@ else
   log "Sorting complete: $COUNT files into $(find "$SORTED_DIR" -mindepth 1 -maxdepth 1 -type d | wc -l) buckets."
 fi
 
-# ─── Step 5: Compute MD5 hashes ─────────────────────────────────────
-log "=== Step 5: Compute MD5 hashes ==="
+# ─── Step 6: Compute MD5 hashes ─────────────────────────────────────
+log "=== Step 6: Compute MD5 hashes ==="
 if [ -f "$WORK/.hash-done" ]; then
   log "Hashes already computed, skipping."
 else
@@ -121,8 +167,8 @@ else
   touch "$WORK/.hash-done"
 fi
 
-# ─── Step 6: Build JSON index ───────────────────────────────────────
-log "=== Step 6: Build MD5 JSON index ==="
+# ─── Step 7: Build JSON index ───────────────────────────────────────
+log "=== Step 7: Build MD5 JSON index ==="
 if [ -f "$WORK/.index-done" ]; then
   log "Index already built, skipping."
 else
@@ -164,8 +210,8 @@ PYEOF
   log "Index written to $INDEX_FILE"
 fi
 
-# ─── Step 7: Upload buckets to archive.org ───────────────────────────
-log "=== Step 7: Upload image buckets ==="
+# ─── Step 8: Upload buckets to archive.org ───────────────────────────
+log "=== Step 8: Upload image buckets ==="
 touch "$UPLOAD_LOG"
 
 BUCKET_TOTAL=$(find "$SORTED_DIR" -mindepth 1 -maxdepth 1 -type d | wc -l)
@@ -266,8 +312,8 @@ for bucket_dir in "$SORTED_DIR"/*/; do
   fi
 done
 
-# ─── Step 8: Upload MD5 index ───────────────────────────────────────
-log "=== Step 8: Upload MD5 index ==="
+# ─── Step 9: Upload MD5 index ───────────────────────────────────────
+log "=== Step 9: Upload MD5 index ==="
 if grep -q "^${COLLECTION}-index OK$" "$UPLOAD_LOG" 2>/dev/null; then
   log "Index already uploaded, skipping."
 else
