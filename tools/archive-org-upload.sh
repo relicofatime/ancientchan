@@ -19,7 +19,7 @@ set -euo pipefail
 
 MAGNET='magnet:?xt=urn:btih:9671fb0855c7931fe98f03f7612c18010fb10121&dn=4chan-mlp&tr=udp%3a%2f%2fopen.stealth.si%3a80%2fannounce&tr=udp%3a%2f%2ftracker1.bt.moack.co.kr%3a80%2fannounce&tr=udp%3a%2f%2ftracker.theoks.net%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.4.babico.name.tr%3a3131%2fannounce&tr=udp%3a%2f%2ftracker.openbittorrent.com%3a6969%2fannounce&tr=http%3a%2f%2ftracker.openbittorrent.com%3a80%2fannounce&tr=https%3a%2f%2ftracker1.520.jp%3a443%2fannounce&tr=udp%3a%2f%2fopen.demonii.com%3a1337%2fannounce&tr=udp%3a%2f%2ftracker.tiny-vps.com%3a6969%2fannounce&tr=udp%3a%2f%2fsanincode.com%3a6969%2fannounce&tr=udp%3a%2f%2ftracker.opentrackr.org%3a1337%2fannounce&tr=udp%3a%2f%2fuploads.gamecoast.net%3a6969%2fannounce&tr=udp%3a%2f%2fexodus.desync.com%3a6969%2fannounce&tr=udp%3a%2f%2fexplodie.org%3a6969%2fannounce&tr=udp%3a%2f%2fmovies.zsw.ca%3a6969%2fannounce'
 
-WORK=/mnt/data
+WORK=${WORK:-/root/data}
 TORRENT_DIR="$WORK/torrent"
 SORTED_DIR="$WORK/sorted"
 HASH_FILE="$WORK/all-md5.txt"
@@ -64,7 +64,7 @@ else
   log "Starting torrent download (this will take hours)..."
   aria2c --seed-time=0 --max-concurrent-downloads=5 --split=5 \
     --dir="$TORRENT_DIR" --continue=true \
-    --bt-save-metadata=true --bt-stop-timeout=600 \
+    --bt-save-metadata=true --bt-stop-timeout=0 --summary-interval=30 \
     "$MAGNET"
   touch "$WORK/.torrent-done"
   log "Torrent download complete."
