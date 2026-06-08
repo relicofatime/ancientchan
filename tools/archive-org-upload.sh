@@ -32,11 +32,11 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
 # ─── Step 0: Install dependencies ───────────────────────────────────
 log "=== Step 0: Dependencies ==="
+mkdir -p "$WORK"
 sudo apt-get update -qq
-sudo apt-get install -y -qq aria2 python3-pip python3-venv jq
-python3 -m venv "$WORK/venv"
-source "$WORK/venv/bin/activate"
-pip install --quiet internetarchive
+sudo apt-get install -y -qq aria2 python3-pip jq
+pip3 install --quiet --break-system-packages internetarchive
+export PATH="$HOME/.local/bin:$PATH"
 
 # ─── Step 1: Configure archive.org ──────────────────────────────────
 log "=== Step 1: Configure archive.org ==="
