@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.7.3
+// @version      0.7.4
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -290,8 +290,8 @@
     const parts = _etFmt.formatToParts(new Date(unixSec * 1000));
     const g = (t) => (parts.find((p) => p.type === t) || {}).value || '';
     let hh = g('hour'); if (hh === '24') hh = '00';
-    // 2012 4chan stamps were MM/DD/YY(Day)HH:MM — no seconds.
-    return `${g('month')}/${g('day')}/${g('year')}(${g('weekday')})${hh}:${g('minute')}`;
+    // Replay stamps include seconds so posts arriving in the same minute are ordered visibly.
+    return `${g('month')}/${g('day')}/${g('year')}(${g('weekday')})${hh}:${g('minute')}:${g('second')}`;
   }
 
   // ── Network (CORS-free via GM) ───────────────────────────────────────────
