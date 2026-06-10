@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.7.8
+// @version      0.7.9
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -989,14 +989,16 @@
     const thumbLink = absArchiveUrl(base, m.thumb_link);
     const mediaFilename = m.media_filename || '';
     const mediaFilenameProcessed = m.media_filename_processed || '';
+    const rawHash = validMediaHash(m.media_hash) ? m.media_hash : '';
+    const safeHash = validMediaHash(m.safe_media_hash) ? m.safe_media_hash : '';
     return {
       thumb: thumbLink,
       full: mediaLink || remoteMediaLink,
       fname: mediaFilenameProcessed || mediaFilename ||
         filenameFromUrl(mediaLink || remoteMediaLink || thumbLink),
       meta: (m.media_w && m.media_h) ? `${m.media_w}x${m.media_h}` : '',
-      hash: m.safe_media_hash || normalizedHash(m.media_hash),
-      rawHash: m.media_hash || '',
+      hash: safeHash || normalizedHash(rawHash),
+      rawHash,
       board,
       sourceBase: base,
       mediaId: m.media_id || '',
@@ -1305,7 +1307,20 @@
       m && m.rawHash,
       normalizedHash(m && m.rawHash),
       normalizedHash(m && m.hash)
-    ].filter(Boolean));
+    ].filter(validMediaHash));
+  }
+  function validMediaHash(hash) {
+    const h = String(hash || '').trim();
+    if (!h || /^\d+$/.test(h)) return false;
+    const raw = h.replace(/-/g, '+').replace(/_/g, '/');
+    const bare = raw.replace(/=+$/, '');
+    return /^[A-Za-z0-9+/]{22}$/.test(bare) && (raw.length === 22 || /^[A-Za-z0-9+/]{22}==$/.test(raw));
+  }
+  function firstMediaHash(items) {
+    for (const item of items || []) {
+      for (const hash of mediaHashes(item)) return hash;
+    }
+    return '';
   }
   function cleanMediaName(n) {
     return filenameFromUrl(n).trim();
@@ -1514,12 +1529,10 @@
   const IA_MLP_DIRECT_MONTHS = new Set(['2012-06', '2012-07']);
   function archiveOrgIndexHashKeys(hash) {
     const h = String(hash || '').trim();
-    if (!h) return [];
-    const keys = [h];
+    if (!validMediaHash(h)) return [];
     const raw = h.replace(/-/g, '+').replace(/_/g, '/');
-    keys.push(raw);
-    keys.push(raw + '='.repeat((4 - raw.length % 4) % 4));
-    return uniq(keys.filter((k) => /^[A-Za-z0-9+/]{22}={0,2}$/.test(k)));
+    const bare = raw.replace(/=+$/, '');
+    return uniq([bare, `${bare}==`]);
   }
   function archiveOrgIndexPathCandidates(path) {
     const m = String(path || '').match(/^(\d{4}-\d{2})\/([^/?#]+)$/);
@@ -1828,7 +1841,7 @@
   }
   async function resolveMlpArchiveOrgFirstMedia(p, kind, ctx, local, expectedHash, apiP) {
     const api = await apiP;
-    const apiHash = expectedHash || (api[0] && (api[0].rawHash || api[0].hash)) || '';
+    const apiHash = expectedHash || firstMediaHash(api);
     const primarySeeds = [...local, ...api];
     const primaryHash = apiHash || expectedHash;
     mediaDebug(api.length ? 'debug' : 'warn', `resolve ${kind} post API candidates`, { ...ctx, count: api.length, archiveOrgFirst: true });
@@ -1916,7 +1929,7 @@
     if (!p || !p.num) return null;
     const ctx = { board: engine.board, num: p.num, kind };
     const local = p.media ? [p.media] : [];
-    const expectedHash = (p.media && (p.media.rawHash || p.media.hash)) || '';
+    const expectedHash = firstMediaHash(local);
     mediaDebug('debug', 'resolve start', {
       ...ctx,
       expectedHash,
@@ -1940,7 +1953,7 @@
         return { ...r, thumbFallback: false };
       }
       const api = await apiP;
-      const apiHash = expectedHash || (api[0] && (api[0].rawHash || api[0].hash)) || '';
+      const apiHash = expectedHash || firstMediaHash(api);
       mediaDebug(api.length ? 'debug' : 'warn', 'resolve thumb post API candidates', { ...ctx, count: api.length });
       const indexedApi = await archiveOrgIndexedMedia(engine.board, [...local, ...api]);
       r = await firstFull(indexedApi, apiHash);
@@ -1991,7 +2004,7 @@
       return r;
     }
     const api = await apiP;
-    const apiHash = fullHash || (api[0] && (api[0].rawHash || api[0].hash)) || '';
+    const apiHash = fullHash || firstMediaHash(api);
     mediaDebug(api.length ? 'debug' : 'warn', 'resolve full post API candidates', { ...ctx, count: api.length });
     const indexedApi = await archiveOrgIndexedMedia(engine.board, [...local, ...api]);
     r = await firstFull(indexedApi, apiHash);
