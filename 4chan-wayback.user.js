@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.8.2
+// @version      0.8.3
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -578,6 +578,9 @@
   }
   function archiveOrgDirectFileUrl(url) {
     return /^https?:\/\/archive\.org\/download\/4chan-mlp-archive-(?:2012-05|2012-06)\/[^/]+$/i.test(url);
+  }
+  function archiveOrgMlpRehostUrl(url) {
+    return archiveOrgZipUrl(url) || archiveOrgDirectFileUrl(url);
   }
   function mediaSourceKind(url) {
     if (archiveOrgZipUrl(url)) return 'archive.org zip';
@@ -1221,14 +1224,28 @@
     const key = `${board}:${num}`;
     if (_postMediaCache.has(key)) return _postMediaCache.get(key);
     const p = (async () => {
-      const found = await Promise.all(archiveAPIsFor(board).map(async (base) => {
+      const readOne = async (base) => {
         const url = `${base}/_/api/chan/post/?board=${board}&num=${num}`;
         let data;
         try { data = await gmJSON(url, 8000); }
         catch (e) { mediaDebug('warn', 'post API failed', { board, num, base, url, error: String(e && e.message || e) }); return null; }
         return mediaFromApi(data && data.media, base, board);
-      }));
-      const media = found.filter((m) => m && (m.thumb || m.full));
+      };
+      const usable = (m) => m && (m.thumb || m.full || mediaHashes(m).length);
+      let found;
+      if (mlpArchiveOrgFirstRequired(board)) {
+        found = [];
+        for (const base of archiveAPIsFor(board)) {
+          const m = await readOne(base);
+          if (!usable(m)) continue;
+          found.push(m);
+          mediaDebug('debug', 'post API media sequential hit', { board, num, base, hash: firstMediaHash([m]) });
+          break;
+        }
+      } else {
+        found = await Promise.all(archiveAPIsFor(board).map(readOne));
+      }
+      const media = found.filter(usable);
       mediaDebug(media.length ? 'debug' : 'warn', 'post API media results', { board, num, count: media.length, media });
       if (!media.length) _postMediaCache.delete(key);
       return media;
@@ -1623,6 +1640,18 @@
       for (const file of mediaFullFiles(m)) {
         for (const u of archiveOrgDownloadCandidates(board, file)) archiveOrgFirst.push(u);
       }
+      if (mlpArchiveOrgFirstRequired(board)) {
+        const candidates = uniq(archiveOrgFirst.filter(archiveOrgMlpRehostUrl)).slice(0, MEDIA_URL_CAP);
+        mediaDebug(candidates.length ? 'debug' : 'warn', 'media URL candidates archive.org-only', {
+          board,
+          kind,
+          count: candidates.length,
+          archiveOrgOnly: true,
+          names: mediaNames(m),
+          candidates
+        });
+        return candidates;
+      }
       for (const url of [m.full, m.mediaLink, m.remoteMediaLink]) addMediaUrlCandidates(fast, url);
       for (const file of mediaFullFiles(m)) {
         for (const u of mediaFilePathCandidates(board, 'image', file)) fast.push(u);
@@ -1647,6 +1676,18 @@
 
     for (const file of mediaFullFiles(m)) {
       for (const u of archiveOrgDownloadCandidates(board, file)) archiveOrgFirst.push(u);
+    }
+    if (mlpArchiveOrgFirstRequired(board)) {
+      const candidates = uniq(archiveOrgFirst.filter(archiveOrgMlpRehostUrl)).slice(0, MEDIA_URL_CAP);
+      mediaDebug(candidates.length ? 'debug' : 'warn', 'media URL candidates archive.org-only', {
+        board,
+        kind,
+        count: candidates.length,
+        archiveOrgOnly: true,
+        names: mediaNames(m),
+        candidates
+      });
+      return candidates;
     }
     for (const url of [m.thumb, m.thumbLink]) addMediaUrlCandidates(fast, url);
     for (const url of [m.full, m.mediaLink, m.remoteMediaLink]) {
@@ -1747,7 +1788,11 @@
     const indexed = await archiveOrgIndexedMedia(board, media);
     let r = await firstFull(indexed, expectedHash);
     if (r) return r;
-    return firstFullMatching(media, expectedHash, true);
+    const urls = mlpArchiveOrgFirstRequired(board)
+      ? uniq(fullUrls(media).filter(archiveOrgMlpRehostUrl))
+      : mediaUrlsMatching(fullUrls(media), true);
+    const found = expectedHash ? await firstVerifiedBlob(urls, expectedHash) : await firstBlob(urls);
+    return found ? { ...found, thumbFallback: false } : null;
   }
   const FOURCHAN_404_IMAGES = [
     'Angelguy.png',
@@ -2225,7 +2270,7 @@
     `actp:v1:${board}:${date}:${base.replace(/^https?:\/\//, '').replace(/[^a-z0-9]+/gi, '_')}:${page}`;
   const threadCacheKey = (board, num) => `thr:v5:${board}:${num}`;
   const threadSummaryCacheKey = (board, num) => `thrs:v1:${board}:${num}`;
-  const mediaResolveCacheKey = (board, num, kind) => `media:v10:${board}:${num}:${kind}`;
+  const mediaResolveCacheKey = (board, num, kind) => `media:v11:${board}:${num}:${kind}`;
   const localPostCacheKey = (board) => `localposts:v1:${board}`;
   const postIdentityCacheKey = () => 'postIdentity:v1';
 
