@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.6.9
+// @version      0.7.0
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -157,7 +157,8 @@
     mediaResolveConcurrency: 3,
     mediaMissCacheMs: 24 * 60 * 60 * 1000,
     mediaPersistentCache: true,
-    mediaPersistentMaxBytes: 2 * 1024 * 1024,
+    mediaPersistentMaxBytes: 8 * 1024 * 1024,
+    threadPersistentCache: true,
     localPostMaxImageBytes: 1024 * 1024,
     mediaDebug: false,
     cacheDebug: false
@@ -305,10 +306,42 @@
   // Archives (desuarchive especially) 429 bursts of API calls. Instead of
   // treating that as "no data" and rendering an empty board, back off per
   // host, hold new requests to that host until the cooldown passes, and
-  // retry. Status is shown in the control bar (#wb-ratelimit).
+  // retry. Status is shown in the control bar (#wb-ratelimit). Generic 5xx
+  // responses are not classified as rate limits: desuarchive often clears a
+  // transient 503 on an immediate normal browser refresh.
   const _rateLimits = new Map(); // host → { until }
   const RATE_LIMIT_MAX_RETRIES = 4;
+  const TRANSIENT_STATUS_MAX_RETRIES = 2;
   let _rlTimer = null;
+
+  function responseHeader(headers, name) {
+    const re = new RegExp('(?:^|\\n)' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ':\\s*([^\\r\\n]+)', 'i');
+    const m = re.exec(headers || '');
+    return m ? m[1].trim() : '';
+  }
+  function retryAfterMs(responseHeaders) {
+    const v = responseHeader(responseHeaders, 'retry-after');
+    if (!v) return 0;
+    const seconds = Number(v);
+    if (seconds > 0 && seconds <= 120) return seconds * 1000;
+    const ts = Date.parse(v);
+    const ms = ts - Date.now();
+    return ms > 0 && ms <= 120000 ? ms : 0;
+  }
+  function isRateLimitResponse(r) {
+    if (r.status === 429) return true;
+    if (!r.status || r.status < 400) return false;
+    const text = String(r.responseText || '').slice(0, 2048);
+    return /\b(?:too many requests|rate[-\s]?limit(?:ed|ing)?|throttled)\b/i.test(text);
+  }
+  function transientRetryMs(responseHeaders, attempt) {
+    const backoff = Math.min(750 * Math.pow(2, attempt), 3000);
+    const retryAfter = retryAfterMs(responseHeaders);
+    return retryAfter ? Math.min(retryAfter, 3000) : backoff;
+  }
+  function isTransientStatus(status) {
+    return status === 500 || status === 502 || status === 503 || status === 504;
+  }
 
   function noteRateLimit(url, responseHeaders, attempt) {
     const h = mediaHost(url);
@@ -316,6 +349,10 @@
     let ms = Math.min(5000 * Math.pow(2, attempt), 60000);
     const m = /(?:^|\n)retry-after:\s*(\d+)/i.exec(responseHeaders || '');
     if (m && Number(m[1]) > 0 && Number(m[1]) <= 120) ms = Number(m[1]) * 1000;
+    // Jitter so the parallel requests that all got 429'd don't re-burst in
+    // sync and immediately re-trip the limiter.
+    ms += Math.floor(Math.random() * 4000);
+    ms = retryAfterMs(responseHeaders) || ms;
     const prev = _rateLimits.get(h);
     const until = Date.now() + ms;
     _rateLimits.set(h, { until: prev ? Math.max(prev.until, until) : until });
@@ -342,7 +379,7 @@
       return;
     }
     const secs = Math.max(1, Math.ceil((worst.until - Date.now()) / 1000));
-    span.textContent = `rate limited by ${worst.host} — retrying in ${secs}s`;
+    span.textContent = `rate limited by ${worst.host} - retrying in ${secs}s`;
     if (!_rlTimer) _rlTimer = setInterval(updateRateLimitUI, 1000);
   }
 
@@ -358,10 +395,14 @@
           ontimeout: () => reject(new Error('Timeout: ' + url))
         });
       });
-      if (r.status === 429 || r.status === 503) {
+      if (isRateLimitResponse(r)) {
         if (attempt >= RATE_LIMIT_MAX_RETRIES) throw statusError(r, url);
         noteRateLimit(url, r.responseHeaders, attempt);
         continue; // loops back through rateLimitPause
+      }
+      if (isTransientStatus(r.status) && attempt < TRANSIENT_STATUS_MAX_RETRIES) {
+        await sleep(transientRetryMs(r.responseHeaders, attempt));
+        continue;
       }
       if (!okStatus(r.status)) throw statusError(r, url);
       clearRateLimit(url);
@@ -373,12 +414,22 @@
   function gmJSON(url, timeout = 30000) { return gmGet(url, { timeout, json: true }); }
   function gmText(url) { return gmGet(url, { timeout: 40000 }); }
   const MEDIA_TIMEOUT_MS = 5000;
+  const MEDIA_ARCHIVE_ORG_TIMEOUT_MS = 30000;
   const MEDIA_BATCH_SIZE = 8;
   const _hostFails = new Map();
   const HOST_FAIL_THRESHOLD = 4;
   const HOST_FAIL_WINDOW_MS = 60000;
   function mediaHost(url) { try { return new URL(url).host; } catch (e) { return ''; } }
+  function archiveOrgMedia(url) {
+    return /\b(?:web\.)?archive\.org\b/i.test(mediaHost(url));
+  }
+  function mediaFetchTimeout(url) {
+    return archiveOrgMedia(url) ? MEDIA_ARCHIVE_ORG_TIMEOUT_MS : MEDIA_TIMEOUT_MS;
+  }
   function trackHostFail(url) {
+    // archive.org/Wayback is often slow for a specific object without the whole
+    // host being down; don't let a few slow captures suppress all later attempts.
+    if (archiveOrgMedia(url)) return;
     const h = mediaHost(url);
     if (!h) return;
     const now = Date.now();
@@ -387,17 +438,100 @@
     _hostFails.set(h, fails);
   }
   function hostIsDown(url) {
+    if (archiveOrgMedia(url)) return false;
     const h = mediaHost(url);
     if (!h) return false;
     const fails = _hostFails.get(h);
     return fails && fails.filter((t) => Date.now() - t < HOST_FAIL_WINDOW_MS).length >= HOST_FAIL_THRESHOLD;
   }
   const _blobCache = new Map();
+  const _mediaDebugLog = [];
+  const MEDIA_DEBUG_LOG_LIMIT = 500;
+  function archiveOrgZipUrl(url) {
+    return /^https?:\/\/archive\.org\/download\/4chan-mlp-archive-\d{4}-\d{2}\/\d{4}-\d{2}\.zip\//i.test(url);
+  }
+  function mediaSourceKind(url) {
+    if (archiveOrgZipUrl(url)) return 'archive.org zip';
+    if (/^https?:\/\/web\.archive\.org\/web\/2id_\//i.test(url)) return 'wayback raw';
+    if (/\barchive\.org\b/i.test(url)) return 'archive.org';
+    if (/\bdesuarchive\.org\b|\bdesu-usergeneratedcontent\.xyz\b/i.test(url)) return 'desuarchive';
+    if (/\b4plebs\.org\b|\bimg\.4plebs\.org\b/i.test(url)) return '4plebs';
+    if (/\barchived\.moe\b/i.test(url)) return 'archived.moe';
+    if (/\bi\.4cdn\.org\b|\bimages\.4chan\.org\b/i.test(url)) return '4chan original';
+    return mediaHost(url);
+  }
+  function mediaHeaderSummary(headers) {
+    const out = {};
+    for (const name of ['content-type', 'content-length', 'content-encoding', 'location', 'server', 'x-archive-orig-content-type']) {
+      const v = responseHeader(headers, name);
+      if (v) out[name] = v;
+    }
+    return out;
+  }
+  function mediaResponseMeta(url, r) {
+    const blob = r && r.response;
+    return {
+      source: mediaSourceKind(url),
+      host: mediaHost(url),
+      status: (r && r.status) || 0,
+      finalUrl: (r && r.finalUrl) || '',
+      size: (blob && blob.size) || 0,
+      type: (blob && blob.type) || '',
+      headers: mediaHeaderSummary((r && r.responseHeaders) || ''),
+      url
+    };
+  }
+  function mediaRejectReason(r, type) {
+    if (!r) return 'no response';
+    if (!(r.status >= 200 && r.status < 300)) return `HTTP ${r.status || 0}`;
+    if (!r.response) return 'empty response object';
+    if (!r.response.size) return 'empty blob';
+    if (type && (type.startsWith('text') || type.includes('html'))) return `non-image content type ${type}`;
+    return 'unknown rejection';
+  }
+  function blobTextSnippet(blob, max = 500) {
+    return new Promise((resolve) => {
+      if (!blob || !blob.slice || typeof FileReader !== 'function') { resolve(''); return; }
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || '').replace(/\s+/g, ' ').slice(0, max));
+      reader.onerror = () => resolve('');
+      try { reader.readAsText(blob.slice(0, max)); } catch (e) { resolve(''); }
+    });
+  }
+  function logRejectedMediaResponse(url, r, reason) {
+    const meta = { ...mediaResponseMeta(url, r), reason };
+    mediaDebug('warn', 'fetch rejected', meta);
+    const blob = r && r.response;
+    const type = (blob && blob.type) || '';
+    if (blob && blob.size && (type.startsWith('text') || type.includes('html') || /archive\.org/i.test(url))) {
+      blobTextSnippet(blob).then((snippet) => {
+        if (snippet) mediaDebug('warn', 'fetch rejected body snippet', { ...meta, snippet });
+      });
+    }
+  }
   function mediaDebug(level, msg, data = {}) {
     if (!CONFIG.mediaDebug) return;
+    const entry = {
+      ts: new Date().toISOString(),
+      level,
+      msg,
+      data
+    };
+    _mediaDebugLog.push(entry);
+    if (_mediaDebugLog.length > MEDIA_DEBUG_LOG_LIMIT) _mediaDebugLog.splice(0, _mediaDebugLog.length - MEDIA_DEBUG_LOG_LIMIT);
+    try { window.oldchanMediaLog = _mediaDebugLog; } catch (e) { /* window unavailable */ }
     const fn = level === 'warn' ? console.warn : console.debug;
     try { fn.call(console, `[oldchan media] ${msg}`, data); } catch (e) { /* console unavailable */ }
   }
+  try {
+    window.oldchanMediaLog = _mediaDebugLog;
+    window.oldchanMediaDiagnostics = {
+      log: _mediaDebugLog,
+      enable: () => { CONFIG.mediaDebug = true; saveSettings(); return 'oldchan media diagnostics enabled'; },
+      disable: () => { CONFIG.mediaDebug = false; saveSettings(); return 'oldchan media diagnostics disabled'; },
+      clear: () => { _mediaDebugLog.length = 0; return 'oldchan media diagnostics cleared'; }
+    };
+  } catch (e) { /* window unavailable */ }
   const MEDIA_CACHE_NAME = 'oldchan-media-v1';
   function mediaCacheAvailable() {
     return !!(CONFIG.mediaPersistentCache && 'caches' in window && window.caches);
@@ -435,27 +569,86 @@
       mediaDebug('warn', 'persistent media cache write failed', { host: mediaHost(url), url, error: String(e && e.message || e) });
     });
   }
+  // ── Persistent full-thread cache (browser Cache Storage, like media) ─────
+  // GM storage has an 8MB budget, far too small for full thread JSON — but
+  // Cache Storage holds gigabytes. Archived threads are immutable (they
+  // ended years ago), so an old thread never needs re-fetching; only threads
+  // with recent activity get a freshness window.
+  const THREAD_CACHE_NAME = 'oldchan-threads-v1';
+  const THREAD_IMMUTABLE_AGE_S = 30 * 86400; // last post older than this → thread can never change
+  const THREAD_FRESH_MS = 3600 * 1000;       // recent threads: trust cache for 1h
+  function threadCacheAvailable() {
+    return !!(CONFIG.threadPersistentCache && 'caches' in window && window.caches);
+  }
+  function threadCacheRequestUrl(board, num) {
+    return `/__oldchan_thread_cache__?b=${encodeURIComponent(board)}&n=${encodeURIComponent(num)}`;
+  }
+  async function cachedThreadFull(board, num) {
+    if (!threadCacheAvailable()) return null;
+    try {
+      const cache = await caches.open(THREAD_CACHE_NAME);
+      const res = await cache.match(threadCacheRequestUrl(board, num));
+      if (!res) return null;
+      const data = await res.json();
+      if (!data || !validThreadResult(data.result)) return null;
+      const lastTs = Number(data.result.posts[data.result.posts.length - 1].ts) || 0;
+      const threadAgeS = Date.now() / 1000 - lastTs;
+      if (threadAgeS < THREAD_IMMUTABLE_AGE_S && Date.now() - (data.cachedAt || 0) > THREAD_FRESH_MS) return null;
+      return data.result;
+    } catch (e) {
+      return null;
+    }
+  }
+  function storeThreadFull(board, num, result) {
+    if (!threadCacheAvailable() || !validThreadResult(result)) return;
+    caches.open(THREAD_CACHE_NAME).then((cache) => cache.put(
+      threadCacheRequestUrl(board, num),
+      new Response(JSON.stringify({ cachedAt: Date.now(), result }),
+        { headers: { 'Content-Type': 'application/json' } })
+    )).catch(() => { /* quota or private mode — fetch path still works */ });
+  }
+
   function gmBlobURL(url) {
-    if (hostIsDown(url)) return Promise.resolve(null);
-    if (_blobCache.has(url)) return _blobCache.get(url);
+    if (hostIsDown(url)) {
+      mediaDebug('warn', 'fetch skipped, host marked down', { source: mediaSourceKind(url), host: mediaHost(url), url });
+      return Promise.resolve(null);
+    }
+    if (_blobCache.has(url)) {
+      mediaDebug('debug', 'fetch promise cache hit', { source: mediaSourceKind(url), host: mediaHost(url), url });
+      return _blobCache.get(url);
+    }
     const p = (async () => {
       const cached = await cachedMediaBlobURL(url);
       if (cached) return cached;
       return new Promise((resolve) => {
-      mediaDebug('debug', 'fetch start', { host: mediaHost(url), url });
-      GM_xmlhttpRequest({
-        method: 'GET', url, responseType: 'blob', timeout: MEDIA_TIMEOUT_MS,
-        onload: (r) => {
-          const t = (r.response && r.response.type) || '';
-          const ok = r.status >= 200 && r.status < 300 && r.response && r.response.size > 0 &&
-            !t.startsWith('text') && !t.includes('html');
-          if (!ok) { resolve(null); return; }
-          storeMediaBlob(url, r.response);
-          resolve(URL.createObjectURL(r.response));
-        },
-        onerror: () => { trackHostFail(url); resolve(null); },
-        ontimeout: () => { trackHostFail(url); resolve(null); }
-      });
+        const timeout = mediaFetchTimeout(url);
+        mediaDebug('debug', 'fetch start', { source: mediaSourceKind(url), host: mediaHost(url), timeout, url });
+        GM_xmlhttpRequest({
+          method: 'GET', url, responseType: 'blob', timeout,
+          onload: (r) => {
+            const t = (r.response && r.response.type) || '';
+            const ok = r.status >= 200 && r.status < 300 && r.response && r.response.size > 0 &&
+              !t.startsWith('text') && !t.includes('html');
+            if (!ok) {
+              logRejectedMediaResponse(url, r, mediaRejectReason(r, t));
+              resolve(null);
+              return;
+            }
+            mediaDebug('debug', 'fetch ok', mediaResponseMeta(url, r));
+            storeMediaBlob(url, r.response);
+            resolve(URL.createObjectURL(r.response));
+          },
+          onerror: (e) => {
+            trackHostFail(url);
+            mediaDebug('warn', 'fetch network error', { source: mediaSourceKind(url), host: mediaHost(url), url, error: String(e && e.message || e || '') });
+            resolve(null);
+          },
+          ontimeout: () => {
+            trackHostFail(url);
+            mediaDebug('warn', 'fetch timeout', { source: mediaSourceKind(url), host: mediaHost(url), timeout, url });
+            resolve(null);
+          }
+        });
       });
     })();
     _blobCache.set(url, p);
@@ -768,6 +961,11 @@
   async function firstBlobBatch(urls) {
     return firstSuccess(urls.map((u) => gmBlobURL(u).then((b) => b ? { blob: b, url: u } : null)));
   }
+  function archiveOrgZipFirst(urls) {
+    const priority = [], rest = [];
+    for (const u of urls) (archiveOrgZipUrl(u) ? priority : rest).push(u);
+    return [priority, rest];
+  }
 
   // Resolve to the first candidate that actually loads. Candidates are probed
   // in small parallel batches so one dead host cannot stall the whole chain.
@@ -778,8 +976,18 @@
       return null;
     }
     mediaDebug('debug', 'candidate list', { count: unique.length, urls: unique });
-    for (let i = 0; i < unique.length; i += MEDIA_BATCH_SIZE) {
-      const batch = unique.slice(i, i + MEDIA_BATCH_SIZE);
+    const [priority, rest] = archiveOrgZipFirst(unique);
+    if (priority.length) {
+      mediaDebug('debug', 'archive.org zip priority batch', { size: priority.length, urls: priority });
+      const found = await firstBlobBatch(priority);
+      if (found) {
+        mediaDebug('debug', 'candidate selected from archive.org zip priority', { url: found.url });
+        return found;
+      }
+      mediaDebug('debug', 'archive.org zip priority batch miss', { size: priority.length });
+    }
+    for (let i = 0; i < rest.length; i += MEDIA_BATCH_SIZE) {
+      const batch = rest.slice(i, i + MEDIA_BATCH_SIZE);
       mediaDebug('debug', 'candidate batch', { start: i, size: batch.length, urls: batch });
       const found = await firstBlobBatch(batch);
       if (found) {
@@ -1084,29 +1292,56 @@
   function archiveOrgZipCandidates(board, file) {
     if (board !== 'mlp') return [];
     const m = String(file || '').match(/^(\d{10,13})\.[a-z0-9]+$/i);
-    if (!m) return [];
+    if (!m) {
+      mediaDebug('debug', 'archive.org zip candidate skipped', { board, file, reason: 'filename is not a 4chan timestamp media name' });
+      return [];
+    }
     const ts = Number(m[1].slice(0, 10));
-    if (!(ts >= IA_MLP_FIRST && ts < IA_MLP_END)) return [];
+    if (!(ts >= IA_MLP_FIRST && ts < IA_MLP_END)) {
+      mediaDebug('debug', 'archive.org zip candidate skipped', {
+        board, file, ts,
+        reason: 'timestamp outside archive.org mlp rehost coverage',
+        coverageStart: IA_MLP_FIRST,
+        coverageEndExclusive: IA_MLP_END
+      });
+      return [];
+    }
     const d = new Date(ts * 1000);
     const ym = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}`;
-    return [`https://archive.org/download/4chan-mlp-archive-${ym}/${ym}.zip/${file}`];
+    const url = `https://archive.org/download/4chan-mlp-archive-${ym}/${ym}.zip/${file}`;
+    mediaDebug('debug', 'archive.org zip candidate added', { board, file, ts, ym, url });
+    return [url];
   }
 
   const MEDIA_URL_CAP = 24;
   function mediaUrlCandidates(m, kind) {
     if (!m) return [];
     const board = mediaBoard(m);
-    const fast = [], slow = [];
+    const archiveOrgFirst = [], fast = [], slow = [];
     if (kind === 'full') {
+      for (const file of mediaFullFiles(m)) {
+        for (const u of archiveOrgZipCandidates(board, file)) archiveOrgFirst.push(u);
+      }
       for (const url of [m.full, m.mediaLink, m.remoteMediaLink]) addMediaUrlCandidates(fast, url);
       for (const file of mediaFullFiles(m)) {
         for (const u of mediaFilePathCandidates(board, 'image', file)) fast.push(u);
-        for (const u of archiveOrgZipCandidates(board, file)) fast.push(u);
         for (const u of originalFourcdnCandidates(board, file)) fast.push(u);
         for (const u of extraArchiveCandidates(board, 'image', file)) slow.push(u);
         for (const u of waybackCandidates(board, file)) slow.push(u);
       }
-      return uniq([...fast, ...slow]).slice(0, MEDIA_URL_CAP);
+      const candidates = uniq([...archiveOrgFirst, ...fast, ...slow]).slice(0, MEDIA_URL_CAP);
+      if (board === 'mlp' || candidates.some((u) => /archive\.org/i.test(u))) {
+        mediaDebug('debug', 'media URL candidates', {
+          board,
+          kind,
+          count: candidates.length,
+          archiveOrgFirst,
+          archiveOrg: candidates.filter((u) => /archive\.org/i.test(u)),
+          names: mediaNames(m),
+          candidates
+        });
+      }
+      return candidates;
     }
 
     for (const url of [m.thumb, m.thumbLink]) addMediaUrlCandidates(fast, url);
@@ -1118,7 +1353,18 @@
       for (const u of extraArchiveCandidates(board, 'thumb', file)) slow.push(u);
       for (const u of waybackThumbCandidates(board, file)) slow.push(u);
     }
-    return uniq([...fast, ...slow]).slice(0, MEDIA_URL_CAP);
+    const candidates = uniq([...fast, ...slow]).slice(0, MEDIA_URL_CAP);
+    if (board === 'mlp' || candidates.some((u) => /archive\.org/i.test(u))) {
+      mediaDebug('debug', 'media URL candidates', {
+        board,
+        kind,
+        count: candidates.length,
+        archiveOrg: candidates.filter((u) => /archive\.org/i.test(u)),
+        names: mediaNames(m),
+        candidates
+      });
+    }
+    return candidates;
   }
 
   function fullUrls(media) {
@@ -1133,14 +1379,43 @@
   }
   async function firstVerifiedBlob(urls, expectedHash) {
     const unique = uniq(urls);
-    for (let i = 0; i < unique.length; i += MEDIA_BATCH_SIZE) {
-      const batch = unique.slice(i, i + MEDIA_BATCH_SIZE);
+    mediaDebug('debug', 'verified candidate list', {
+      count: unique.length,
+      expectedHash,
+      archiveOrg: unique.filter((u) => /archive\.org/i.test(u)),
+      urls: unique
+    });
+    const [priority, rest] = archiveOrgZipFirst(unique);
+    if (priority.length) {
+      mediaDebug('debug', 'verified archive.org zip priority batch', { size: priority.length, expectedHash, urls: priority });
+      const found = await firstBlobBatch(priority);
+      if (found && (!expectedHash || await verifyBlobHash(found.blob, expectedHash))) {
+        mediaDebug('debug', 'verified candidate selected from archive.org zip priority', { url: found.url, expectedHash });
+        return found;
+      }
+      if (found) {
+        mediaDebug('warn', 'archive.org zip priority hash mismatch, falling back', { url: found.url, expectedHash });
+        URL.revokeObjectURL(found.blob);
+      } else {
+        mediaDebug('debug', 'verified archive.org zip priority batch miss', { size: priority.length, expectedHash });
+      }
+    }
+    for (let i = 0; i < rest.length; i += MEDIA_BATCH_SIZE) {
+      const batch = rest.slice(i, i + MEDIA_BATCH_SIZE);
+      mediaDebug('debug', 'verified candidate batch', { start: i, size: batch.length, expectedHash, urls: batch });
       const found = await firstBlobBatch(batch);
-      if (!found) continue;
-      if (!expectedHash || await verifyBlobHash(found.blob, expectedHash)) return found;
-      mediaDebug('warn', 'hash mismatch, skipping candidate', { url: found.url });
+      if (!found) {
+        mediaDebug('debug', 'verified candidate batch miss', { start: i, size: batch.length, expectedHash });
+        continue;
+      }
+      if (!expectedHash || await verifyBlobHash(found.blob, expectedHash)) {
+        mediaDebug('debug', 'verified candidate selected', { url: found.url, expectedHash });
+        return found;
+      }
+      mediaDebug('warn', 'hash mismatch, skipping candidate', { url: found.url, expectedHash });
       URL.revokeObjectURL(found.blob);
     }
+    mediaDebug('warn', 'verified candidate list failed', { count: unique.length, expectedHash });
     return null;
   }
   async function firstFull(media, expectedHash) {
@@ -1352,6 +1627,14 @@
     const resolvedKey = mediaResolveCacheKey(engine.board, p.num, kind);
     const cachedResolved = cacheGet(resolvedKey);
     if (cachedResolved && cachedResolved.url) {
+      mediaDebug('debug', 'cached resolved URL check', {
+        board: engine.board,
+        num: p.num,
+        kind,
+        resolvedKey,
+        url: cachedResolved.url,
+        thumbFallback: !!cachedResolved.thumbFallback
+      });
       const cachedPromise = gmBlobURL(cachedResolved.url).then((blob) => {
         if (blob) {
           const r = {
@@ -1359,9 +1642,23 @@
             url: cachedResolved.url,
             thumbFallback: !!cachedResolved.thumbFallback
           };
+          mediaDebug('debug', 'cached resolved URL ok', {
+            board: engine.board,
+            num: p.num,
+            kind,
+            resolvedKey,
+            url: cachedResolved.url
+          });
           _postBlobResultCache.set(key, r);
           return r;
         }
+        mediaDebug('warn', 'cached resolved URL failed, invalidating', {
+          board: engine.board,
+          num: p.num,
+          kind,
+          resolvedKey,
+          url: cachedResolved.url
+        });
         cacheDelete(resolvedKey);
         _postBlobCache.delete(key);
         _postBlobResultCache.delete(key);
@@ -1371,9 +1668,25 @@
       return cachedPromise;
     }
     if (cachedResolved && cachedResolved.miss && Date.now() - (cachedResolved.cachedAt || 0) < CONFIG.mediaMissCacheMs) {
+      mediaDebug('debug', 'cached media miss', {
+        board: engine.board,
+        num: p.num,
+        kind,
+        resolvedKey,
+        ageMs: Date.now() - (cachedResolved.cachedAt || 0)
+      });
       return Promise.resolve(null);
     }
-    if (cachedResolved && cachedResolved.miss) cacheDelete(resolvedKey);
+    if (cachedResolved && cachedResolved.miss) {
+      mediaDebug('debug', 'expired cached media miss, retrying', {
+        board: engine.board,
+        num: p.num,
+        kind,
+        resolvedKey,
+        ageMs: Date.now() - (cachedResolved.cachedAt || 0)
+      });
+      cacheDelete(resolvedKey);
+    }
     const promise = resolvePostMediaBlob(p, kind).then((r) => {
       if (!r || (kind === 'full' && r.thumbFallback)) _postBlobCache.delete(key);
       if (r && !(kind === 'full' && r.thumbFallback)) _postBlobResultCache.set(key, r);
@@ -1510,7 +1823,7 @@
     `actp:v1:${board}:${date}:${base.replace(/^https?:\/\//, '').replace(/[^a-z0-9]+/gi, '_')}:${page}`;
   const threadCacheKey = (board, num) => `thr:v5:${board}:${num}`;
   const threadSummaryCacheKey = (board, num) => `thrs:v1:${board}:${num}`;
-  const mediaResolveCacheKey = (board, num, kind) => `media:v2:${board}:${num}:${kind}`;
+  const mediaResolveCacheKey = (board, num, kind) => `media:v4:${board}:${num}:${kind}`;
   const localPostCacheKey = (board) => `localposts:v1:${board}`;
   const postIdentityCacheKey = () => 'postIdentity:v1';
 
@@ -2059,7 +2372,15 @@
     if (_threadFetchCache.has(key)) {
       result = await _threadFetchCache.get(key);
     } else {
-      const pending = fetchThreadFresh(board, num).finally(() => _threadFetchCache.delete(key));
+      const pending = (async () => {
+        if (!opts.force) {
+          const cached = await cachedThreadFull(board, num);
+          if (cached) return cached;
+        }
+        const fresh = await fetchThreadFresh(board, num);
+        storeThreadFull(board, num, fresh);
+        return fresh;
+      })().finally(() => _threadFetchCache.delete(key));
       _threadFetchCache.set(key, pending);
       result = await pending;
     }
@@ -3326,7 +3647,8 @@
     cacheSet('settings', {
       board: engine.board, date: CONFIG.date, startTime: CONFIG.startTime,
       speed: engine.speed, barHidden: engine.barHidden, autoUpdate: engine.autoUpdate,
-      colors: activeColors, design: activeDesign, catalogSort: engine.catalogSort
+      colors: activeColors, design: activeDesign, catalogSort: engine.catalogSort,
+      mediaDebug: !!CONFIG.mediaDebug, cacheDebug: !!CONFIG.cacheDebug
     });
   }
 
@@ -3796,6 +4118,8 @@
       engine.speed = saved.speed || engine.speed;
       engine.barHidden = !!saved.barHidden;
       if (typeof saved.autoUpdate === 'boolean') engine.autoUpdate = saved.autoUpdate;
+      if (typeof saved.mediaDebug === 'boolean') CONFIG.mediaDebug = saved.mediaDebug;
+      if (typeof saved.cacheDebug === 'boolean') CONFIG.cacheDebug = saved.cacheDebug;
       engine.catalogSort = normCatalogSort(saved.catalogSort);
       applyTheme(saved.theme || saved.colors);
       applyDesign(saved.design);
@@ -3829,6 +4153,62 @@
     GM_registerMenuCommand('Replay this board on a different date', () => {
       const d = prompt('Replay date (YYYY-MM-DD):', CONFIG.date);
       if (d) { CONFIG.date = d; saveSettings(); boot({ freshClock: true }); }
+    });
+    GM_registerMenuCommand(`${CONFIG.mediaDebug ? 'Disable' : 'Enable'} image fetch diagnostics`, () => {
+      CONFIG.mediaDebug = !CONFIG.mediaDebug;
+      saveSettings();
+      if (CONFIG.mediaDebug) {
+        mediaDebug('debug', 'diagnostics enabled', {
+          note: 'Image fetch diagnostics are now logging to the console and window.oldchanMediaLog.'
+        });
+      } else {
+        try { console.info('[oldchan media] diagnostics disabled'); } catch (e) { /* console unavailable */ }
+      }
+    });
+    GM_registerMenuCommand('Dump image fetch diagnostics', () => {
+      try {
+        console.table(_mediaDebugLog.map((e) => ({
+          ts: e.ts,
+          level: e.level,
+          msg: e.msg,
+          source: e.data && e.data.source || '',
+          status: e.data && e.data.status || '',
+          type: e.data && e.data.type || '',
+          size: e.data && e.data.size || '',
+          reason: e.data && e.data.reason || '',
+          url: e.data && e.data.url || ''
+        })));
+        console.log('[oldchan media] raw diagnostics', _mediaDebugLog);
+      } catch (e) { /* console unavailable */ }
+    });
+    GM_registerMenuCommand('Clear image fetch diagnostics', () => {
+      _mediaDebugLog.length = 0;
+      try { console.info('[oldchan media] diagnostics cleared'); } catch (e) { /* console unavailable */ }
+    });
+    GM_registerMenuCommand('Clear cached image fetches', () => {
+      let deleted = 0;
+      for (const k of cacheKeys()) {
+        if (/^media:/.test(k) && cacheDelete(k)) deleted++;
+      }
+      _blobCache.clear();
+      _postBlobCache.clear();
+      _postBlobResultCache.clear();
+      _postMediaCache.clear();
+      _searchMediaCache.clear();
+      if (mediaCacheAvailable()) {
+        caches.delete(MEDIA_CACHE_NAME).then((ok) => {
+          try { console.info(`[oldchan media] cleared ${deleted} image resolution entries; persistent media cache deleted: ${ok}`); } catch (e) { /* console unavailable */ }
+        });
+      } else {
+        try { console.info(`[oldchan media] cleared ${deleted} image resolution entries`); } catch (e) { /* console unavailable */ }
+      }
+    });
+    GM_registerMenuCommand('Clear cached threads', () => {
+      if ('caches' in window && window.caches) {
+        caches.delete(THREAD_CACHE_NAME).then((ok) => {
+          try { console.info(`[oldchan] persistent thread cache deleted: ${ok}`); } catch (e) { /* console unavailable */ }
+        });
+      }
     });
 
     // The clock is a pure function of wall time, but setInterval is throttled or
