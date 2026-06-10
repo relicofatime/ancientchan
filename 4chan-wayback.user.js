@@ -141,11 +141,10 @@
     prefetchDelayMs: 250,
     prefetchConcurrency: 2,
     catalogActivityMaxDays: 365,
-    catalogActivityThreadTarget: 180,
-    catalogActivitySearchMaxPages: 20,
-    catalogPruneGraceHours: 6,
+    catalogActivityThreadTarget: 300,
+    catalogActivitySearchMaxPages: 60,
     catalogHydrateConcurrency: 2,
-    catalogHydrateLimit: 200,
+    catalogHydrateLimit: 400,
     catalogHydrateYieldMs: 40,
     catalogSyncUpdateEvery: 10,
     catalogTinyOpsThreshold: 12,
@@ -527,8 +526,12 @@
   function archiveOrgZipUrl(url) {
     return /^https?:\/\/archive\.org\/download\/4chan-mlp-archive-\d{4}-\d{2}\/\d{4}-\d{2}\.zip\//i.test(url);
   }
+  function archiveOrgDirectFileUrl(url) {
+    return /^https?:\/\/archive\.org\/download\/4chan-mlp-archive-(?:2012-05|2012-06)\/[^/]+$/i.test(url);
+  }
   function mediaSourceKind(url) {
     if (archiveOrgZipUrl(url)) return 'archive.org zip';
+    if (archiveOrgDirectFileUrl(url)) return 'archive.org direct';
     if (/^https?:\/\/web\.archive\.org\/web\/2id_\//i.test(url)) return 'wayback raw';
     if (/\barchive\.org\b/i.test(url)) return 'archive.org';
     if (/\bdesuarchive\.org\b|\bdesu-usergeneratedcontent\.xyz\b/i.test(url)) return 'desuarchive';
@@ -671,7 +674,12 @@
   function openThreadCache() {
     return _threadCacheHandle || (_threadCacheHandle = caches.open(THREAD_CACHE_NAME));
   }
-  async function cachedThreadFull(board, num) {
+  function cachedThreadFromMemory(board, num) {
+    if (board !== engine.board) return null;
+    const posts = engine.threads.get(String(num));
+    return posts && posts.length ? { posts, source: 'memory' } : null;
+  }
+  async function cachedThreadFull(board, num, opts = {}) {
     if (!threadCacheAvailable()) return null;
     try {
       const cache = await openThreadCache();
@@ -682,11 +690,16 @@
       const fresh = Date.now() - (data.cachedAt || 0) <= THREAD_FRESH_MS;
       // Degraded results (fetched while a better archive was unreachable)
       // are only trusted briefly — they must retry, not pin a bad copy.
-      if (data.result.degraded && !fresh) return null;
+      if (data.result.degraded && !fresh && !opts.allowDegraded) return null;
       const lastTs = Number(data.result.posts[data.result.posts.length - 1].ts) || 0;
       const threadAgeS = Date.now() / 1000 - lastTs;
-      if (threadAgeS < THREAD_IMMUTABLE_AGE_S && !fresh) return null;
-      return data.result;
+      if (threadAgeS < THREAD_IMMUTABLE_AGE_S && !fresh && !opts.allowStale) return null;
+      return {
+        ...data.result,
+        source: data.result.source || 'thread-cache',
+        staleCache: !fresh,
+        degraded: !!data.result.degraded
+      };
     } catch (e) {
       return null;
     }
@@ -1061,7 +1074,7 @@
 
   // Resolve to the first candidate that actually loads. Candidates are probed
   // in small parallel batches so one dead host cannot stall the whole chain.
-  // archive.org zip candidates race inside their batch like everyone else —
+  // archive.org candidates race inside their batch like everyone else —
   // serializing them first stalled every image behind archive.org's slow
   // misses whenever a month's item wasn't (yet) uploaded.
   async function firstBlob(urls) {
@@ -1371,24 +1384,27 @@
     ].filter(Boolean));
   }
   // ── archive.org re-hosted /mlp/ images (heinessen, 2012-05 → 2014-11) ────
-  // 635k full-size golden-era images re-hosted as one stored zip per month;
-  // archive.org serves individual members at:
+  // 635k full-size golden-era images re-hosted by month. 2012-05 and
+  // 2012-06 were uploaded as loose files in their month items; later months
+  // are stored as one zip per month. archive.org serves them at:
+  //   https://archive.org/download/4chan-mlp-archive-YYYY-MM/<file>          (2012-05/06)
   //   https://archive.org/download/4chan-mlp-archive-YYYY-MM/YYYY-MM.zip/<file>
   // 4chan filenames are unix timestamps, so the month bucket is derivable
   // straight from the filename — no index download needed. Wrong guesses
   // just 404 and the MD5 verification in firstVerifiedBlob rejects fakes.
   const IA_MLP_FIRST = Date.UTC(2012, 4, 1) / 1000;   // coverage start, 2012-05-01
   const IA_MLP_END = Date.UTC(2014, 11, 1) / 1000;    // coverage end (excl), 2014-12-01
-  function archiveOrgZipCandidates(board, file) {
+  const IA_MLP_DIRECT_MONTHS = new Set(['2012-05', '2012-06']);
+  function archiveOrgDownloadCandidates(board, file) {
     if (board !== 'mlp') return [];
     const m = String(file || '').match(/^(\d{10,13})\.[a-z0-9]+$/i);
     if (!m) {
-      mediaDebug('debug', 'archive.org zip candidate skipped', { board, file, reason: 'filename is not a 4chan timestamp media name' });
+      mediaDebug('debug', 'archive.org candidate skipped', { board, file, reason: 'filename is not a 4chan timestamp media name' });
       return [];
     }
     const ts = Number(m[1].slice(0, 10));
     if (!(ts >= IA_MLP_FIRST && ts < IA_MLP_END)) {
-      mediaDebug('debug', 'archive.org zip candidate skipped', {
+      mediaDebug('debug', 'archive.org candidate skipped', {
         board, file, ts,
         reason: 'timestamp outside archive.org mlp rehost coverage',
         coverageStart: IA_MLP_FIRST,
@@ -1398,8 +1414,14 @@
     }
     const d = new Date(ts * 1000);
     const ym = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}`;
-    const url = `https://archive.org/download/4chan-mlp-archive-${ym}/${ym}.zip/${file}`;
-    mediaDebug('debug', 'archive.org zip candidate added', { board, file, ts, ym, url });
+    const url = IA_MLP_DIRECT_MONTHS.has(ym)
+      ? `https://archive.org/download/4chan-mlp-archive-${ym}/${file}`
+      : `https://archive.org/download/4chan-mlp-archive-${ym}/${ym}.zip/${file}`;
+    mediaDebug('debug', 'archive.org candidate added', {
+      board, file, ts, ym,
+      layout: IA_MLP_DIRECT_MONTHS.has(ym) ? 'direct' : 'zip',
+      url
+    });
     return [url];
   }
 
@@ -1410,7 +1432,7 @@
     const archiveOrgFirst = [], fast = [], slow = [];
     if (kind === 'full') {
       for (const file of mediaFullFiles(m)) {
-        for (const u of archiveOrgZipCandidates(board, file)) archiveOrgFirst.push(u);
+        for (const u of archiveOrgDownloadCandidates(board, file)) archiveOrgFirst.push(u);
       }
       for (const url of [m.full, m.mediaLink, m.remoteMediaLink]) addMediaUrlCandidates(fast, url);
       for (const file of mediaFullFiles(m)) {
@@ -1905,14 +1927,14 @@
   }
   const indexCacheKey = (board, date) => `idx:v8:${board}:${date}`;
   const catalogCacheKey = (board, date) =>
-    `catalog:v7:${board}:${date}:active${CONFIG.catalogActivityThreadTarget}:d${CONFIG.catalogActivityMaxDays}`;
+    `catalog:v9:${board}:${date}:active${CONFIG.catalogActivityThreadTarget}:d${CONFIG.catalogActivityMaxDays}`;
   const indexPageCacheKey = (board, date, base, page) =>
     `idxp:v1:${board}:${date}:${base.replace(/^https?:\/\//, '').replace(/[^a-z0-9]+/gi, '_')}:${page}`;
   const activityPageCacheKey = (board, date, base, page) =>
     `actp:v1:${board}:${date}:${base.replace(/^https?:\/\//, '').replace(/[^a-z0-9]+/gi, '_')}:${page}`;
   const threadCacheKey = (board, num) => `thr:v5:${board}:${num}`;
   const threadSummaryCacheKey = (board, num) => `thrs:v1:${board}:${num}`;
-  const mediaResolveCacheKey = (board, num, kind) => `media:v4:${board}:${num}:${kind}`;
+  const mediaResolveCacheKey = (board, num, kind) => `media:v5:${board}:${num}:${kind}`;
   const localPostCacheKey = (board) => `localposts:v1:${board}`;
   const postIdentityCacheKey = () => 'postIdentity:v1';
 
@@ -2282,43 +2304,66 @@
     const cachedOps = Array.isArray(cached) ? cached : (cached && Array.isArray(cached.ops) ? cached.ops : null);
     const endClock = replayEndTs(date);
     const targetClock = Math.min(Number(opts.atClock) || endClock, endClock);
-    const target = Math.max(CONFIG.indexPages * CONFIG.indexThreadsPerPage,
-      CONFIG.catalogActivityThreadTarget || 0);
-    if (cachedOps && !opts.force && !tinyCatalogOps(cachedOps)) {
-      loadCachedThreadSummariesIntoMemory(board, cachedOps);
-      const withLocal = mergeLocalCatalogOps(cachedOps, board, date);
-      const visibleAtTarget = visibleCatalogStatesFromOps(withLocal, targetClock).length;
-      const visibleAtEnd = visibleCatalogStatesFromOps(withLocal, endClock, { browseCatalog: true }).length;
-      if (visibleAtTarget >= target && visibleAtEnd >= target) return withLocal;
-    }
-
+    const target = catalogActiveCapacity();
     const all = [];
     const seen = new Set();
     const seenThreads = new Set();
     const maxDays = Math.max(1, CONFIG.catalogActivityMaxDays || 365);
     let visibleAtTarget = 0;
     let visibleAtEnd = 0;
-    const emit = () => {
-      if (opts.onProgress) opts.onProgress(mergeLocalCatalogOps(sortedUniqueOps(all), board, date), { board, date });
+    const mergeOp = (op) => {
+      if (!op || !op.num || seen.has(String(op.num))) return false;
+      seen.add(String(op.num));
+      seenThreads.add(String(op.num));
+      all.push(op);
+      return true;
     };
+    const currentOps = () => mergeLocalCatalogOps(sortedUniqueOps(all), board, date);
+    const recount = () => {
+      const ops = currentOps();
+      visibleAtTarget = visibleCatalogStatesFromOps(ops, targetClock).length;
+      visibleAtEnd = visibleCatalogStatesFromOps(ops, endClock, { browseCatalog: true }).length;
+      return ops;
+    };
+    const emit = (reason = 'catalog') => {
+      const ops = recount();
+      if (opts.onProgress) opts.onProgress(ops, { board, date, reason, visibleAtTarget, visibleAtEnd, target });
+      return ops;
+    };
+
+    if (cachedOps && !opts.force) {
+      loadCachedThreadSummariesIntoMemory(board, cachedOps);
+      for (const op of cachedOps) mergeOp(op);
+      const ops = emit('cached catalog');
+      if (cached && cached.complete && !tinyCatalogOps(cachedOps) && !opts.expand) return ops;
+    }
+
+    try {
+      const dayOps = await enumerateDay(board, date, { includeLocal: false });
+      let added = false;
+      for (const op of dayOps || []) if (mergeOp(op)) added = true;
+      if (added) emit('selected day ops');
+    } catch (e) {
+      cacheDebug('warn', 'selected day OP scan failed', { board, date, error: String(e && e.message || e) });
+    }
+
     const addThreadCandidate = async (threadNum) => {
       if (!threadNum || seenThreads.has(String(threadNum))) return false;
       seenThreads.add(String(threadNum));
       let result;
-      try { result = await fetchThread(board, threadNum); }
+      try { result = await fetchThread(board, threadNum, { preferCache: true }); }
       catch (e) { return false; }
       if (!validThreadResult(result)) return false;
       const op = result.posts[0];
-      if (!op || !op.num || seen.has(String(op.num)) || op.ts > endClock) return false;
-      seen.add(String(op.num));
-      all.push(op);
-      if (catalogState(op, targetClock)) visibleAtTarget++;
-      if (catalogState(op, endClock, { browseCatalog: true })) visibleAtEnd++;
-      emit();
+      if (!op || !op.num || op.ts > endClock || !mergeOp(op)) return false;
+      emit('activity thread');
       return true;
     };
 
+    let scannedDays = 0;
+    let scanFailed = false;
     for (let offset = 0; offset < maxDays && (visibleAtTarget < target || visibleAtEnd < target); offset++) {
+      scannedDays = offset + 1;
       const day = addDays(date, -offset);
       for (const base of searchArchivesForBoard(board)) {
         const activity = await enumerateArchiveActivityDay(board, day, base, {
@@ -2329,6 +2374,7 @@
           continue;
         }
         if (!activity.ok) {
+          scanFailed = true;
           cacheDebug('warn', 'archive activity search failed', { board, day, base, error: activity.error });
           continue;
         }
@@ -2341,13 +2387,15 @@
     }
     sortedUniqueOps(all);
     all.sort((a, b) => a.ts - b.ts || Number(a.num) - Number(b.num));
+    recount();
     cacheSet(key, {
       ops: all,
       scannedAt: Date.now(),
       target,
       maxDays,
       visibleAtTarget,
-      visibleAtEnd
+      visibleAtEnd,
+      complete: (visibleAtTarget >= target && visibleAtEnd >= target) || (!scanFailed && scannedDays >= maxDays)
     });
     return mergeLocalCatalogOps(all, board, date);
   }
@@ -2467,16 +2515,58 @@
   async function fetchThread(board, num, opts = {}) {
     const key = threadCacheKey(board, num);
     let result;
+    if (opts.preferCache && !opts.force) {
+      const memory = cachedThreadFromMemory(board, num);
+      if (memory) {
+        result = memory;
+        cacheThreadResult(board, num, result);
+        result = mergeLocalThreadResult(board, num, result);
+        rememberThreadResult(num, result);
+        return result;
+      }
+      const cached = await cachedThreadFull(board, num, { allowStale: true, allowDegraded: true });
+      if (cached) {
+        result = cached;
+        cacheThreadResult(board, num, result);
+        result = mergeLocalThreadResult(board, num, result);
+        rememberThreadResult(num, result);
+        return result;
+      }
+    }
     if (_threadFetchCache.has(key)) {
       result = await _threadFetchCache.get(key);
     } else {
       const pending = (async () => {
         if (!opts.force) {
-          const cached = await cachedThreadFull(board, num);
+          const memory = cachedThreadFromMemory(board, num);
+          if (memory) return memory;
+          const cached = await cachedThreadFull(board, num, {
+            allowStale: !!opts.preferCache,
+            allowDegraded: !!opts.preferCache
+          });
           if (cached) return cached;
         }
-        const fresh = await fetchThreadFresh(board, num);
-        storeThreadFull(board, num, fresh);
+        const fallback = !opts.force ? await cachedThreadFull(board, num, {
+          allowStale: true,
+          allowDegraded: true
+        }) : null;
+        let fresh;
+        try {
+          fresh = await fetchThreadFresh(board, num);
+        } catch (e) {
+          if (fallback) return {
+            ...fallback,
+            staleFallback: true,
+            networkError: String(e && e.message || e || 'fetch failed')
+          };
+          throw e;
+        }
+        if (!validThreadResult(fresh) && fallback) return {
+          ...fallback,
+          staleFallback: true,
+          networkError: fresh && fresh.error || 'fetch failed'
+        };
+        if (validThreadResult(fresh)) storeThreadFull(board, num, fresh);
         return fresh;
       })().finally(() => _threadFetchCache.delete(key));
       _threadFetchCache.set(key, pending);
@@ -2520,7 +2610,7 @@
     const worker = async () => {
       while (token === engine.catalogToken && next < queue.length) {
         const op = queue[next++];
-        try { await fetchThread(board, op.num); }
+        try { await fetchThread(board, op.num, { preferCache: true }); }
         catch (e) { /* keep hydrating the rest */ }
         finally {
           engine.catalogHydrateDone++;
@@ -3005,6 +3095,10 @@
   function normCatalogSort(sort) {
     return CATALOG_SORTS.includes(sort) ? sort : 'bump';
   }
+  function catalogActiveCapacity() {
+    return Math.max(CONFIG.indexPages * CONFIG.indexThreadsPerPage,
+      CONFIG.catalogActivityThreadTarget || 0);
+  }
   function compareCatalogStates(a, b, sort = 'bump') {
     const sticky = (b.sticky ? 1 : 0) - (a.sticky ? 1 : 0);
     if (sticky) return sticky;
@@ -3034,11 +3128,8 @@
       deleted: summary.deleted,
       expiredTs: summary.expiredTs || 0
     } : (posts[0] || op);
-    const grace = CONFIG.catalogPruneGraceHours * 3600;
-    const selectedDayOp = etDateString(op.ts) === CONFIG.date;
-    const keepSelectedDayArchiveOp = selectedDayOp;
 
-    if (!keepSelectedDayArchiveOp && (hydrated || useSummary) &&
+    if ((hydrated || useSummary) &&
       (threadOp.deleted || (threadOp.expiredTs && threadOp.expiredTs <= atClock))) return null;
     if (useSummary) {
       return {
@@ -3064,13 +3155,6 @@
         ].join('|')
       };
     }
-    if (hydrated && !selectedDayOp) {
-      const lastKnown = posts[posts.length - 1];
-      if (lastKnown && atClock > lastKnown.ts + grace) return null;
-    } else if (useSummary && !selectedDayOp) {
-      if (summary.lastTs && atClock > summary.lastTs + grace) return null;
-    }
-
     const visible = posts.filter((p) => p.ts <= atClock);
     if (!visible.length) return null;
 
@@ -3173,8 +3257,13 @@
       const state = catalogState(op, atClock, opts);
       if (state) states.push({ ...state, num: op.num });
     }
-    states.sort((a, b) => compareCatalogStates(a, b, opts.catalogSort || 'bump'));
-    return states;
+    // Natural archive turnover: a thread is active until enough other threads
+    // bump ahead of it to push it past the board/catalog capacity. No arbitrary
+    // age cutoff; month-long threads survive as long as their bump keeps them in.
+    states.sort((a, b) => compareCatalogStates(a, b, 'bump'));
+    const active = states.slice(0, catalogActiveCapacity());
+    active.sort((a, b) => compareCatalogStates(a, b, opts.catalogSort || 'bump'));
+    return active;
   }
   function visibleCatalogStates(atClock = engine.clock, opts = {}) {
     return visibleCatalogStatesFromOps(engine.ops, atClock, opts);
@@ -3195,6 +3284,10 @@
   function refreshCatalogSnapshot() {
     engine.catalogClock = replayEndTs(CONFIG.date);
     updateCatalog();
+  }
+  function refreshCatalogData() {
+    refreshCatalogSnapshot();
+    ensureCatalogViewOps({ expand: true });
   }
   function refreshCurrentBoardSnapshot() {
     if (engine.catalogView) refreshCatalogSnapshot();
@@ -3436,7 +3529,7 @@
     renderShell();
     const loading = $('#wb-thread-posts');
     if (loading) loading.append(el('div', { class: 'wb-note' }, 'Loading…'));
-    const t = await fetchThread(engine.board, num);
+    const t = await fetchThread(engine.board, num, { preferCache: true });
     engine.thread = t;
     const host = $('#wb-thread-posts');
     if (host) host.innerHTML = '';
@@ -3521,10 +3614,10 @@
     ensureCatalogViewOps();
   }
 
-  async function ensureCatalogViewOps() {
+  async function ensureCatalogViewOps(opts = {}) {
     if (!engine.catalogView) return;
-    const force = tinyCatalogOps(engine.ops);
-    if (engine.ops.length && !force) return;
+    const force = !!opts.force || tinyCatalogOps(engine.ops);
+    if (engine.ops.length && !force && !opts.expand) return;
     if (engine.catalogLoadPending) return engine.catalogLoadPending;
 
     const token = engine.catalogToken;
@@ -4100,7 +4193,7 @@
         } }, `[Auto-update: ${engine.autoUpdate ? 'on' : 'off'}]`);
       bar.append(mk('Return', backToIndex), ' ', mk('Index', goIndex), ' ', mk('Catalog', goCatalog), ' ', update, ' ', auto, ' ', jump);
     } else if (engine.catalogView) {
-      bar.append(mk('Index', () => goIndex(1)), ' ', mk('Update', refreshCatalogSnapshot), ' ', jump);
+      bar.append(mk('Index', () => goIndex(1)), ' ', mk('Update', refreshCatalogData), ' ', jump);
     } else {
       bar.append(mk('Catalog', goCatalog), ' ', mk('Update', refreshIndexSnapshot), ' ', ...indexPageLinks(), ' ', jump);
     }
@@ -4120,7 +4213,7 @@
       while (engine.prefetchQueue.length) {
         const num = engine.prefetchQueue.pop(); // newest-first: the threads on top fill in first
         const alreadyHydrated = engine.threads.has(String(num));
-        await fetchThread(engine.board, num);
+        await fetchThread(engine.board, num, { preferCache: true });
         if (!alreadyHydrated && CONFIG.prefetchDelayMs) await sleep(CONFIG.prefetchDelayMs);
       }
     };
