@@ -93,21 +93,56 @@ if [ "$CAR_COUNT" -gt 0 ]; then
     fi
 
     mkdir -p "$EXTRACT_DIR"
+
+    # Print the real CLI of whatever extractor we installed so any failure is
+    # debuggable from the log (the old version hid all errors in /dev/null).
+    if [ -n "$CAR_BIN" ] && [ -x "$CAR_BIN" ]; then
+      log "go-car version + extract usage:"
+      "$CAR_BIN" version 2>&1 | sed 's/^/    /' || true
+      "$CAR_BIN" extract --help 2>&1 | sed 's/^/    /' || true
+    fi
+
+    # Try the known invocations in order; stderr stays visible so we can see
+    # exactly why a file fails instead of silently ending up with 0 results.
+    extract_one() {
+      local carfile="$1"
+      if [ -n "$CAR_BIN" ] && [ -x "$CAR_BIN" ]; then
+        "$CAR_BIN" extract -f "$carfile" "$EXTRACT_DIR"    2>&1 && return 0
+        "$CAR_BIN" extract -f "$carfile" -o "$EXTRACT_DIR" 2>&1 && return 0
+        "$CAR_BIN" extract "$carfile" "$EXTRACT_DIR"       2>&1 && return 0
+      else
+        ipfs-car unpack "$carfile" --output "$EXTRACT_DIR" 2>&1 && return 0
+      fi
+      return 1
+    }
+
+    # Validate on ONE file before committing to all of them — fail loudly.
+    first_car=$(find "$TORRENT_DIR" -name "*.car" -type f | sort | head -1)
+    before=$(find "$EXTRACT_DIR" -type f | wc -l)
+    log "Test-extracting first file: $first_car"
+    if extract_one "$first_car"; then
+      after=$(find "$EXTRACT_DIR" -type f | wc -l)
+      if [ "$after" -le "$before" ]; then
+        log "WARNING: extractor exited 0 but produced no files. These .car files may"
+        log "         not be UnixFS-encoded, or this one is incomplete. Stopping."
+        exit 1
+      fi
+      log "Test extraction OK ($((after - before)) files from first .car)."
+    else
+      log "ERROR: could not extract $first_car (see go-car error above)."
+      log "       Fix the extractor invocation, then re-run. Not bulk-extracting."
+      exit 1
+    fi
+
     EXTRACTED=0
     while IFS= read -r -d '' carfile; do
-      if [ -n "$CAR_BIN" ] && [ -x "$CAR_BIN" ]; then
-        "$CAR_BIN" extract -f "$carfile" "$EXTRACT_DIR" 2>/dev/null || \
-        "$CAR_BIN" extract --file "$carfile" --output-dir "$EXTRACT_DIR" 2>/dev/null || \
-        "$CAR_BIN" extract "$carfile" "$EXTRACT_DIR" 2>/dev/null || true
-      else
-        ipfs-car unpack "$carfile" --output "$EXTRACT_DIR" 2>/dev/null || true
-      fi
+      extract_one "$carfile" >/dev/null || log "  WARN: failed to extract $carfile"
       EXTRACTED=$((EXTRACTED + 1))
       [ $((EXTRACTED % 25)) -eq 0 ] && log "  extracted $EXTRACTED / $CAR_COUNT .car files..."
     done < <(find "$TORRENT_DIR" -name "*.car" -type f -print0 | sort -z)
 
     EXTRACTED_COUNT=$(find "$EXTRACT_DIR" -type f 2>/dev/null | wc -l)
-    log "Extraction complete: $EXTRACTED .car files → $EXTRACTED_COUNT files."
+    log "Extraction complete: $EXTRACTED .car processed → $EXTRACTED_COUNT output files."
     touch "$WORK/.extract-done"
   fi
 fi
