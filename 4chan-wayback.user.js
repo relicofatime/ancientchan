@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.7.5
+// @version      0.7.6
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -19,6 +19,7 @@
 // @connect      archived.moe
 // @connect      desu-usergeneratedcontent.xyz
 // @connect      archive.org
+// @connect      *.archive.org
 // @connect      us.archive.org
 // @connect      arch.b4k.dev
 // @connect      arch.b4k.co
@@ -191,11 +192,23 @@
     { base: MOE,     boards: ['3', 'a', 'aco', 'adv', 'an', 'b', 'bant', 'biz', 'c', 'cgl', 'ck', 'cm', 'co', 'd', 'diy', 'e', 'f', 'fa', 'fit', 'g', 'gd', 'gif', 'h', 'hc', 'his', 'hm', 'hr', 'i', 'ic', 'int', 'jp', 'k', 'lgbt', 'lit', 'm', 'mlp', 'mlpol', 'mu', 'n', 'news', 'o', 'out', 'p', 'po', 'pol', 'pw', 'q', 'qa', 'qst', 'r', 'r9k', 's', 's4s', 'sci', 'soc', 'sp', 't', 'tg', 'toy', 'trash', 'trv', 'tv', 'u', 'v', 'vg', 'vip', 'vm', 'vmg', 'vp', 'vr', 'vrpg', 'vst', 'vt', 'w', 'wg', 'wsg', 'wsr', 'x', 'xs', 'y'] }
   ];
   const SUPPORTED_BOARDS = Array.from(new Set(ARCHIVE_COVERAGE.flatMap((a) => a.boards))).sort();
+  // Per-board overrides for hosts that are technically available but noisy or
+  // worse as a first choice. /mlp/ has B4K and archived.moe coverage; keep Desu
+  // as a fallback because it rate-limits heavily under replay load.
+  const BOARD_ARCHIVE_PREFERENCE = {
+    mlp: [B4K, MOE, DESU]
+  };
+
   // Every archive that hosts this board, best first. Falls back to archived.moe
   // for an unrecognised board rather than fanning out to everything blindly.
   function archivesForBoard(board) {
     const hosts = ARCHIVE_COVERAGE.filter((a) => a.boards.includes(board)).map((a) => a.base);
-    return hosts.length ? hosts : [MOE];
+    if (!hosts.length) return [MOE];
+    const preferred = BOARD_ARCHIVE_PREFERENCE[board] || [];
+    if (!preferred.length) return hosts;
+    const front = preferred.filter((base) => hosts.includes(base));
+    const rest = hosts.filter((base) => !front.includes(base));
+    return [...front, ...rest];
   }
   // Some archives expose thread/post/media APIs for a board but disable the
   // path-style HTML search page used for date catalog enumeration.
@@ -547,7 +560,7 @@
     return /^https?:\/\/archive\.org\/download\/4chan-mlp-archive-\d{4}-\d{2}\/\d{4}-\d{2}\.zip\//i.test(url);
   }
   function archiveOrgDirectFileUrl(url) {
-    return /^https?:\/\/archive\.org\/download\/4chan-mlp-archive-(?:2012-05|2012-06)\/[^/]+$/i.test(url);
+    return /^https?:\/\/archive\.org\/download\/4chan-mlp-archive-(?:2012-06|2012-07)\/[^/]+$/i.test(url);
   }
   function mediaSourceKind(url) {
     if (archiveOrgZipUrl(url)) return 'archive.org zip';
@@ -1404,17 +1417,17 @@
     ].filter(Boolean));
   }
   // ── archive.org re-hosted /mlp/ images (heinessen, 2012-05 → 2014-11) ────
-  // 635k full-size golden-era images re-hosted by month. 2012-05 and
-  // 2012-06 were uploaded as loose files in their month items; later months
+  // 635k full-size golden-era images re-hosted by month. Some early month
+  // items expose loose files as well as the month zip; later populated months
   // are stored as one zip per month. archive.org serves them at:
-  //   https://archive.org/download/4chan-mlp-archive-YYYY-MM/<file>          (2012-05/06)
+  //   https://archive.org/download/4chan-mlp-archive-YYYY-MM/<file>          (loose months)
   //   https://archive.org/download/4chan-mlp-archive-YYYY-MM/YYYY-MM.zip/<file>
   // 4chan filenames are unix timestamps, so the month bucket is derivable
   // straight from the filename — no index download needed. Wrong guesses
   // just 404 and the MD5 verification in firstVerifiedBlob rejects fakes.
   const IA_MLP_FIRST = Date.UTC(2012, 4, 1) / 1000;   // coverage start, 2012-05-01
   const IA_MLP_END = Date.UTC(2014, 11, 1) / 1000;    // coverage end (excl), 2014-12-01
-  const IA_MLP_DIRECT_MONTHS = new Set(['2012-05', '2012-06']);
+  const IA_MLP_DIRECT_MONTHS = new Set(['2012-06', '2012-07']);
   function archiveOrgDownloadCandidates(board, file) {
     if (board !== 'mlp') return [];
     const m = String(file || '').match(/^(\d{10,13})\.[a-z0-9]+$/i);
@@ -1434,15 +1447,15 @@
     }
     const d = new Date(ts * 1000);
     const ym = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}`;
-    const url = IA_MLP_DIRECT_MONTHS.has(ym)
-      ? `https://archive.org/download/4chan-mlp-archive-${ym}/${file}`
-      : `https://archive.org/download/4chan-mlp-archive-${ym}/${ym}.zip/${file}`;
+    const directUrl = `https://archive.org/download/4chan-mlp-archive-${ym}/${file}`;
+    const zipUrl = `https://archive.org/download/4chan-mlp-archive-${ym}/${ym}.zip/${file}`;
+    const urls = IA_MLP_DIRECT_MONTHS.has(ym) ? [directUrl, zipUrl] : [zipUrl];
     mediaDebug('debug', 'archive.org candidate added', {
       board, file, ts, ym,
-      layout: IA_MLP_DIRECT_MONTHS.has(ym) ? 'direct' : 'zip',
-      url
+      layout: IA_MLP_DIRECT_MONTHS.has(ym) ? 'direct+zip' : 'zip',
+      urls
     });
-    return [url];
+    return urls;
   }
 
   const MEDIA_URL_CAP = 24;
@@ -1476,6 +1489,9 @@
       return candidates;
     }
 
+    for (const file of mediaFullFiles(m)) {
+      for (const u of archiveOrgDownloadCandidates(board, file)) archiveOrgFirst.push(u);
+    }
     for (const url of [m.thumb, m.thumbLink]) addMediaUrlCandidates(fast, url);
     for (const url of [m.full, m.mediaLink, m.remoteMediaLink]) {
       for (const u of thumbCandidatesFromFull(url)) fast.push(u);
@@ -1485,12 +1501,13 @@
       for (const u of extraArchiveCandidates(board, 'thumb', file)) slow.push(u);
       for (const u of waybackThumbCandidates(board, file)) slow.push(u);
     }
-    const candidates = uniq([...fast, ...slow]).slice(0, MEDIA_URL_CAP);
+    const candidates = uniq([...archiveOrgFirst, ...fast, ...slow]).slice(0, MEDIA_URL_CAP);
     if (board === 'mlp' || candidates.some((u) => /archive\.org/i.test(u))) {
       mediaDebug('debug', 'media URL candidates', {
         board,
         kind,
         count: candidates.length,
+        archiveOrgFirst,
         archiveOrg: candidates.filter((u) => /archive\.org/i.test(u)),
         names: mediaNames(m),
         candidates
@@ -1954,7 +1971,7 @@
     `actp:v1:${board}:${date}:${base.replace(/^https?:\/\//, '').replace(/[^a-z0-9]+/gi, '_')}:${page}`;
   const threadCacheKey = (board, num) => `thr:v5:${board}:${num}`;
   const threadSummaryCacheKey = (board, num) => `thrs:v1:${board}:${num}`;
-  const mediaResolveCacheKey = (board, num, kind) => `media:v5:${board}:${num}:${kind}`;
+  const mediaResolveCacheKey = (board, num, kind) => `media:v6:${board}:${num}:${kind}`;
   const localPostCacheKey = (board) => `localposts:v1:${board}`;
   const postIdentityCacheKey = () => 'postIdentity:v1';
 
