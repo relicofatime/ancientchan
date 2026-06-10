@@ -27,6 +27,7 @@ INDEX_FILE="$WORK/md5-index.json"
 COLLECTION="4chan-mlp-archive"
 UPLOAD_LOG="$WORK/upload.log"
 MAX_PER_ITEM=10000
+PARALLEL_UPLOADS=${PARALLEL_UPLOADS:-3}   # concurrent archive.org item uploads
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
@@ -294,31 +295,33 @@ upload_item() {
   fi
 }
 
-for bucket_dir in "$SORTED_DIR"/*/; do
-  [ -d "$bucket_dir" ] || continue
+process_bucket() {
+  local bucket_dir="$1" bucket_num="$2"
+  local bucket file_count
   bucket=$(basename "$bucket_dir")
-  BUCKET_NUM=$((BUCKET_NUM + 1))
   file_count=$(find "$bucket_dir" -maxdepth 1 -type f | wc -l)
-  log "[$BUCKET_NUM/$BUCKET_TOTAL] Bucket $bucket: $file_count files"
+  log "[$bucket_num/$BUCKET_TOTAL] Bucket $bucket: $file_count files"
 
   if [ "$file_count" -le "$MAX_PER_ITEM" ]; then
     # Small enough for a single item
-    upload_item "${COLLECTION}-${bucket}" "$bucket_dir" "$bucket"
+    upload_item "${COLLECTION}-${bucket}" "$bucket_dir" "$bucket" || true
   else
     # Split into parts — archive.org works best with ≤10k files per item
+    local parts part_num part_id local_count filelist
     parts=$(( (file_count + MAX_PER_ITEM - 1) / MAX_PER_ITEM ))
     log "  Splitting into $parts parts ($MAX_PER_ITEM files each)..."
 
-    SPLIT_DIR="$WORK/splits"
-    rm -rf "$SPLIT_DIR"
-    mkdir -p "$SPLIT_DIR"
+    # Per-bucket split dir so parallel buckets don't clobber each other
+    local split_dir="$WORK/splits-$bucket"
+    rm -rf "$split_dir"
+    mkdir -p "$split_dir"
 
     # Write file lists, one per part
     find "$bucket_dir" -maxdepth 1 -type f -printf '%f\n' | sort | \
-      split -l "$MAX_PER_ITEM" -d --additional-suffix=".list" - "$SPLIT_DIR/part-"
+      split -l "$MAX_PER_ITEM" -d --additional-suffix=".list" - "$split_dir/part-"
 
     part_num=0
-    for filelist in "$SPLIT_DIR"/part-*.list; do
+    for filelist in "$split_dir"/part-*.list; do
       [ -f "$filelist" ] || continue
       part_num=$((part_num + 1))
       part_id="${COLLECTION}-${bucket}-part${part_num}"
@@ -348,9 +351,22 @@ for bucket_dir in "$SORTED_DIR"/*/; do
       fi
     done
 
-    rm -rf "$SPLIT_DIR"
+    rm -rf "$split_dir"
   fi
+}
+
+# Upload several items concurrently — archive.org handles parallel items
+# fine and single-stream uploads leave most of the bandwidth unused.
+for bucket_dir in "$SORTED_DIR"/*/; do
+  [ -d "$bucket_dir" ] || continue
+  BUCKET_NUM=$((BUCKET_NUM + 1))
+  process_bucket "$bucket_dir" "$BUCKET_NUM" &
+  while [ "$(jobs -rp | wc -l)" -ge "$PARALLEL_UPLOADS" ]; do
+    wait -n || true   # a failed bucket is logged FAILED and retried next run
+  done
 done
+wait
+log "All bucket uploads finished."
 
 # ─── Step 9: Upload MD5 index ───────────────────────────────────────
 log "=== Step 9: Upload MD5 index ==="
