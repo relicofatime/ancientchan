@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.7.9
+// @version      0.8.0
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -1496,9 +1496,9 @@
     return (m && m.board) || engine.board;
   }
   function mediaFullFiles(m) {
+    if (mlpArchiveOrgFirstRequired(mediaBoard(m)) && !firstMediaHash([m])) return [];
     return uniq([
       m && m.archiveMedia,
-      m && m.mediaOrig,
       m && filenameFromUrl(m.full),
       m && filenameFromUrl(m.mediaLink),
       m && filenameFromUrl(m.remoteMediaLink)
@@ -2271,7 +2271,7 @@
     `actp:v1:${board}:${date}:${base.replace(/^https?:\/\//, '').replace(/[^a-z0-9]+/gi, '_')}:${page}`;
   const threadCacheKey = (board, num) => `thr:v5:${board}:${num}`;
   const threadSummaryCacheKey = (board, num) => `thrs:v1:${board}:${num}`;
-  const mediaResolveCacheKey = (board, num, kind) => `media:v8:${board}:${num}:${kind}`;
+  const mediaResolveCacheKey = (board, num, kind) => `media:v9:${board}:${num}:${kind}`;
   const localPostCacheKey = (board) => `localposts:v1:${board}`;
   const postIdentityCacheKey = () => 'postIdentity:v1';
 
