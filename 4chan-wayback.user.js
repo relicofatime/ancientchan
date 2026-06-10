@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.7.0
+// @version      0.7.1
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -303,16 +303,37 @@
     return new Error(`HTTP ${r.status || 0}: ${url}`);
   }
   // ── Rate-limit detection & backoff ─────────────────────────────────────
-  // Archives (desuarchive especially) 429 bursts of API calls. Instead of
-  // treating that as "no data" and rendering an empty board, back off per
-  // host, hold new requests to that host until the cooldown passes, and
-  // retry. Status is shown in the control bar (#wb-ratelimit). Generic 5xx
-  // responses are not classified as rate limits: desuarchive often clears a
-  // transient 503 on an immediate normal browser refresh.
+  // Archives (desuarchive especially) 429 bursts of API calls. The defense
+  // has two layers: a per-host concurrency gate that keeps us from bursting
+  // in the first place, and a shared per-host cooldown when the server
+  // pushes back anyway. Status is shown in the control bar (#wb-ratelimit).
+  // Generic 5xx responses are not rate limits (desuarchive often clears a
+  // transient 503 on an immediate refresh) but they do get a short shared
+  // pause so concurrent workers don't collectively hammer a struggling host.
   const _rateLimits = new Map(); // host → { until }
   const RATE_LIMIT_MAX_RETRIES = 4;
   const TRANSIENT_STATUS_MAX_RETRIES = 2;
-  let _rlTimer = null;
+  const GM_GET_MAX_WAIT_MS = 35000; // total budget incl. cooldowns — fail over to the next archive rather than sleep forever
+
+  // Per-host concurrency gate. Board loads fan out dozens of API calls; the
+  // gate caps simultaneous in-flight requests per host so the burst that
+  // trips the limiter never happens. Slots are held through cooldown sleeps
+  // on purpose — that's what makes the backoff collective.
+  const HOST_MAX_CONCURRENT = 4;
+  const _hostGates = new Map(); // host → { active, queue }
+  function hostGateAcquire(host) {
+    let g = _hostGates.get(host);
+    if (!g) { g = { active: 0, queue: [] }; _hostGates.set(host, g); }
+    if (g.active < HOST_MAX_CONCURRENT) { g.active++; return Promise.resolve(); }
+    return new Promise((res) => g.queue.push(res));
+  }
+  function hostGateRelease(host) {
+    const g = _hostGates.get(host);
+    if (!g) return;
+    const next = g.queue.shift();
+    if (next) next();
+    else g.active = Math.max(0, g.active - 1);
+  }
 
   function responseHeader(headers, name) {
     const re = new RegExp('(?:^|\\n)' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ':\\s*([^\\r\\n]+)', 'i');
@@ -330,7 +351,10 @@
   }
   function isRateLimitResponse(r) {
     if (r.status === 429) return true;
-    if (!r.status || r.status < 400) return false;
+    // Cloudflare-style "you are being rate limited" pages come back 403.
+    // 5xx pages mentioning rate limiting stay on the transient path — a
+    // server error page quoting the words is not a limiter verdict.
+    if (r.status !== 403) return false;
     const text = String(r.responseText || '').slice(0, 2048);
     return /\b(?:too many requests|rate[-\s]?limit(?:ed|ing)?|throttled)\b/i.test(text);
   }
@@ -343,78 +367,102 @@
     return status === 500 || status === 502 || status === 503 || status === 504;
   }
 
-  function noteRateLimit(url, responseHeaders, attempt) {
-    const h = mediaHost(url);
-    // Honor Retry-After when sane, else exponential: 5s, 10s, 20s, 40s.
-    let ms = Math.min(5000 * Math.pow(2, attempt), 60000);
-    const m = /(?:^|\n)retry-after:\s*(\d+)/i.exec(responseHeaders || '');
-    if (m && Number(m[1]) > 0 && Number(m[1]) <= 120) ms = Number(m[1]) * 1000;
-    // Jitter so the parallel requests that all got 429'd don't re-burst in
-    // sync and immediately re-trip the limiter.
-    ms += Math.floor(Math.random() * 4000);
-    ms = retryAfterMs(responseHeaders) || ms;
-    const prev = _rateLimits.get(h);
+  function extendHostCooldown(host, ms) {
+    const prev = _rateLimits.get(host);
     const until = Date.now() + ms;
-    _rateLimits.set(h, { until: prev ? Math.max(prev.until, until) : until });
+    if (!prev || prev.until < until) _rateLimits.set(host, { until });
+  }
+  function noteRateLimit(url, responseHeaders, attempt) {
+    // Server's Retry-After or exponential 5s/10s/20s/40s — and jitter ON TOP
+    // either way, so the herd of parallel requests doesn't share one wake-up
+    // instant and re-trip the limiter in lockstep.
+    const base = retryAfterMs(responseHeaders) || Math.min(5000 * Math.pow(2, attempt), 60000);
+    extendHostCooldown(mediaHost(url), base + Math.floor(Math.random() * 4000));
     updateRateLimitUI();
   }
-  function clearRateLimit(url) {
-    if (_rateLimits.delete(mediaHost(url))) updateRateLimitUI();
+  // Cooldowns are never deleted on success — a lone request finishing cannot
+  // vouch for a host other waiters just saw 429; entries simply lapse.
+  function hostCooldownRemaining(host) {
+    const rl = _rateLimits.get(host);
+    return rl ? Math.max(0, rl.until - Date.now()) : 0;
   }
-  function rateLimitPause(url) {
-    const rl = _rateLimits.get(mediaHost(url));
-    const waitMs = rl ? rl.until - Date.now() : 0;
-    return waitMs > 0 ? new Promise((res) => setTimeout(res, waitMs)) : Promise.resolve();
-  }
+
+  // Self-rearming countdown: re-queries the span every tick so it survives
+  // renderShell rebuilding the bar, and stops on its own when no cooldown is
+  // active (no interval handle to leak).
+  let _rlUiArmed = false;
   function updateRateLimitUI() {
-    const span = $('#wb-ratelimit');
-    if (!span) return;
     let worst = null;
     for (const [host, rl] of _rateLimits) {
       if (rl.until > Date.now() && (!worst || rl.until > worst.until)) worst = { host, until: rl.until };
     }
-    if (!worst) {
-      span.textContent = '';
-      if (_rlTimer) { clearInterval(_rlTimer); _rlTimer = null; }
-      return;
+    const span = $('#wb-ratelimit');
+    if (span) {
+      span.textContent = worst
+        ? `rate limited by ${worst.host} - retrying in ${Math.max(1, Math.ceil((worst.until - Date.now()) / 1000))}s`
+        : '';
     }
-    const secs = Math.max(1, Math.ceil((worst.until - Date.now()) / 1000));
-    span.textContent = `rate limited by ${worst.host} - retrying in ${secs}s`;
-    if (!_rlTimer) _rlTimer = setInterval(updateRateLimitUI, 1000);
+    if (worst && !_rlUiArmed) {
+      _rlUiArmed = true;
+      setTimeout(() => { _rlUiArmed = false; updateRateLimitUI(); }, 1000);
+    }
   }
 
-  async function gmGet(url, { timeout = 30000, json = false } = {}) {
-    for (let attempt = 0; ; attempt++) {
-      await rateLimitPause(url);
-      const r = await new Promise((resolve, reject) => {
-        GM_xmlhttpRequest({
-          method: 'GET', url, timeout,
-          headers: json ? { 'Accept': 'application/json' } : undefined,
-          onload: resolve,
-          onerror: () => reject(new Error('Network error: ' + url)),
-          ontimeout: () => reject(new Error('Timeout: ' + url))
+  async function gmGet(url, { timeout = 30000, json = false, maxWaitMs = GM_GET_MAX_WAIT_MS } = {}) {
+    const host = mediaHost(url);
+    const deadline = Date.now() + maxWaitMs;
+    let rlAttempts = 0;
+    let transientAttempts = 0;
+    await hostGateAcquire(host);
+    try {
+      for (;;) {
+        // Wait out any shared cooldown — with our own jitter so waiters
+        // trickle back instead of stampeding — but never past this request's
+        // budget: throwing early lets callers fail over to another archive.
+        const cooldown = hostCooldownRemaining(host);
+        if (cooldown > 0) {
+          const wait = cooldown + Math.floor(Math.random() * 2500);
+          if (Date.now() + wait > deadline) throw new Error('Rate limited: ' + url);
+          await sleep(wait);
+          continue; // cooldown may have been extended while we slept
+        }
+        const r = await new Promise((resolve, reject) => {
+          GM_xmlhttpRequest({
+            method: 'GET', url, timeout,
+            headers: json ? { 'Accept': 'application/json' } : undefined,
+            onload: resolve,
+            onerror: () => reject(new Error('Network error: ' + url)),
+            ontimeout: () => reject(new Error('Timeout: ' + url))
+          });
         });
-      });
-      if (isRateLimitResponse(r)) {
-        if (attempt >= RATE_LIMIT_MAX_RETRIES) throw statusError(r, url);
-        noteRateLimit(url, r.responseHeaders, attempt);
-        continue; // loops back through rateLimitPause
+        if (isRateLimitResponse(r)) {
+          if (rlAttempts >= RATE_LIMIT_MAX_RETRIES) throw statusError(r, url);
+          noteRateLimit(url, r.responseHeaders, rlAttempts);
+          rlAttempts++;
+          continue;
+        }
+        if (isTransientStatus(r.status)) {
+          // Short shared pause: every worker hitting this host backs off a
+          // beat together instead of independently hammering a 503ing host.
+          extendHostCooldown(host, 1500 + Math.floor(Math.random() * 1000));
+          if (transientAttempts >= TRANSIENT_STATUS_MAX_RETRIES) throw statusError(r, url);
+          await sleep(transientRetryMs(r.responseHeaders, transientAttempts));
+          transientAttempts++;
+          continue;
+        }
+        if (!okStatus(r.status)) throw statusError(r, url);
+        if (!json) return r.responseText;
+        try { return JSON.parse(r.responseText); }
+        catch (e) { throw new Error('Bad JSON from ' + url); }
       }
-      if (isTransientStatus(r.status) && attempt < TRANSIENT_STATUS_MAX_RETRIES) {
-        await sleep(transientRetryMs(r.responseHeaders, attempt));
-        continue;
-      }
-      if (!okStatus(r.status)) throw statusError(r, url);
-      clearRateLimit(url);
-      if (!json) return r.responseText;
-      try { return JSON.parse(r.responseText); }
-      catch (e) { throw new Error('Bad JSON from ' + url); }
+    } finally {
+      hostGateRelease(host);
     }
   }
   function gmJSON(url, timeout = 30000) { return gmGet(url, { timeout, json: true }); }
   function gmText(url) { return gmGet(url, { timeout: 40000 }); }
   const MEDIA_TIMEOUT_MS = 5000;
-  const MEDIA_ARCHIVE_ORG_TIMEOUT_MS = 30000;
+  const MEDIA_ARCHIVE_ORG_TIMEOUT_MS = 12000;
   const MEDIA_BATCH_SIZE = 8;
   const _hostFails = new Map();
   const HOST_FAIL_THRESHOLD = 4;
@@ -443,6 +491,19 @@
     if (!h) return false;
     const fails = _hostFails.get(h);
     return fails && fails.filter((t) => Date.now() - t < HOST_FAIL_WINDOW_MS).length >= HOST_FAIL_THRESHOLD;
+  }
+  // True while any host is rate-limited or marked down — a "this image
+  // doesn't exist" verdict reached during a disturbance is not trustworthy
+  // and must not be persisted.
+  function networkDisturbed() {
+    const now = Date.now();
+    for (const rl of _rateLimits.values()) {
+      if (rl.until > now) return true;
+    }
+    for (const fails of _hostFails.values()) {
+      if (fails.filter((t) => now - t < HOST_FAIL_WINDOW_MS).length >= HOST_FAIL_THRESHOLD) return true;
+    }
+    return false;
   }
   const _blobCache = new Map();
   const _mediaDebugLog = [];
@@ -499,6 +560,9 @@
     });
   }
   function logRejectedMediaResponse(url, r, reason) {
+    // Diagnostics off (the default): skip building meta and reading blob
+    // bodies — thousands of rejected candidates per board would pay for it.
+    if (!CONFIG.mediaDebug) return;
     const meta = { ...mediaResponseMeta(url, r), reason };
     mediaDebug('warn', 'fetch rejected', meta);
     const blob = r && r.response;
@@ -539,10 +603,14 @@
   function mediaCacheRequestUrl(url) {
     return `/__oldchan_media_cache__?u=${encodeURIComponent(url)}`;
   }
+  let _mediaCacheHandle = null;
+  function openMediaCache() {
+    return _mediaCacheHandle || (_mediaCacheHandle = caches.open(MEDIA_CACHE_NAME));
+  }
   async function cachedMediaBlobURL(url) {
     if (!mediaCacheAvailable()) return null;
     try {
-      const cache = await caches.open(MEDIA_CACHE_NAME);
+      const cache = await openMediaCache();
       const res = await cache.match(mediaCacheRequestUrl(url));
       if (!res) return null;
       const blob = await res.blob();
@@ -559,7 +627,7 @@
     if (!mediaCacheAvailable() || !blob || !blob.size) return;
     const max = Math.max(0, CONFIG.mediaPersistentMaxBytes || 0);
     if (max && blob.size > max) return;
-    caches.open(MEDIA_CACHE_NAME).then((cache) => {
+    openMediaCache().then((cache) => {
       const headers = {};
       if (blob.type) headers['Content-Type'] = blob.type;
       return cache.put(mediaCacheRequestUrl(url), new Response(blob, { headers }));
@@ -583,17 +651,25 @@
   function threadCacheRequestUrl(board, num) {
     return `/__oldchan_thread_cache__?b=${encodeURIComponent(board)}&n=${encodeURIComponent(num)}`;
   }
+  let _threadCacheHandle = null;
+  function openThreadCache() {
+    return _threadCacheHandle || (_threadCacheHandle = caches.open(THREAD_CACHE_NAME));
+  }
   async function cachedThreadFull(board, num) {
     if (!threadCacheAvailable()) return null;
     try {
-      const cache = await caches.open(THREAD_CACHE_NAME);
+      const cache = await openThreadCache();
       const res = await cache.match(threadCacheRequestUrl(board, num));
       if (!res) return null;
       const data = await res.json();
       if (!data || !validThreadResult(data.result)) return null;
+      const fresh = Date.now() - (data.cachedAt || 0) <= THREAD_FRESH_MS;
+      // Degraded results (fetched while a better archive was unreachable)
+      // are only trusted briefly — they must retry, not pin a bad copy.
+      if (data.result.degraded && !fresh) return null;
       const lastTs = Number(data.result.posts[data.result.posts.length - 1].ts) || 0;
       const threadAgeS = Date.now() / 1000 - lastTs;
-      if (threadAgeS < THREAD_IMMUTABLE_AGE_S && Date.now() - (data.cachedAt || 0) > THREAD_FRESH_MS) return null;
+      if (threadAgeS < THREAD_IMMUTABLE_AGE_S && !fresh) return null;
       return data.result;
     } catch (e) {
       return null;
@@ -601,11 +677,16 @@
   }
   function storeThreadFull(board, num, result) {
     if (!threadCacheAvailable() || !validThreadResult(result)) return;
-    caches.open(THREAD_CACHE_NAME).then((cache) => cache.put(
-      threadCacheRequestUrl(board, num),
-      new Response(JSON.stringify({ cachedAt: Date.now(), result }),
-        { headers: { 'Content-Type': 'application/json' } })
-    )).catch(() => { /* quota or private mode — fetch path still works */ });
+    // Defer the (potentially multi-MB) stringify off the hydration hot path.
+    const write = () => {
+      openThreadCache().then((cache) => cache.put(
+        threadCacheRequestUrl(board, num),
+        new Response(JSON.stringify({ cachedAt: Date.now(), result }),
+          { headers: { 'Content-Type': 'application/json' } })
+      )).catch(() => { /* quota or private mode — fetch path still works */ });
+    };
+    if (typeof window.requestIdleCallback === 'function') window.requestIdleCallback(write, { timeout: 4000 });
+    else setTimeout(write, 250);
   }
 
   function gmBlobURL(url) {
@@ -634,7 +715,7 @@
               resolve(null);
               return;
             }
-            mediaDebug('debug', 'fetch ok', mediaResponseMeta(url, r));
+            if (CONFIG.mediaDebug) mediaDebug('debug', 'fetch ok', mediaResponseMeta(url, r));
             storeMediaBlob(url, r.response);
             resolve(URL.createObjectURL(r.response));
           },
@@ -961,14 +1042,12 @@
   async function firstBlobBatch(urls) {
     return firstSuccess(urls.map((u) => gmBlobURL(u).then((b) => b ? { blob: b, url: u } : null)));
   }
-  function archiveOrgZipFirst(urls) {
-    const priority = [], rest = [];
-    for (const u of urls) (archiveOrgZipUrl(u) ? priority : rest).push(u);
-    return [priority, rest];
-  }
 
   // Resolve to the first candidate that actually loads. Candidates are probed
   // in small parallel batches so one dead host cannot stall the whole chain.
+  // archive.org zip candidates race inside their batch like everyone else —
+  // serializing them first stalled every image behind archive.org's slow
+  // misses whenever a month's item wasn't (yet) uploaded.
   async function firstBlob(urls) {
     const unique = uniq(urls);
     if (!unique.length) {
@@ -976,18 +1055,8 @@
       return null;
     }
     mediaDebug('debug', 'candidate list', { count: unique.length, urls: unique });
-    const [priority, rest] = archiveOrgZipFirst(unique);
-    if (priority.length) {
-      mediaDebug('debug', 'archive.org zip priority batch', { size: priority.length, urls: priority });
-      const found = await firstBlobBatch(priority);
-      if (found) {
-        mediaDebug('debug', 'candidate selected from archive.org zip priority', { url: found.url });
-        return found;
-      }
-      mediaDebug('debug', 'archive.org zip priority batch miss', { size: priority.length });
-    }
-    for (let i = 0; i < rest.length; i += MEDIA_BATCH_SIZE) {
-      const batch = rest.slice(i, i + MEDIA_BATCH_SIZE);
+    for (let i = 0; i < unique.length; i += MEDIA_BATCH_SIZE) {
+      const batch = unique.slice(i, i + MEDIA_BATCH_SIZE);
       mediaDebug('debug', 'candidate batch', { start: i, size: batch.length, urls: batch });
       const found = await firstBlobBatch(batch);
       if (found) {
@@ -1077,7 +1146,12 @@
       const match = normalizedHash(actual) === normalizedHash(expectedHash);
       if (!match) mediaDebug('warn', 'hash mismatch', { expected: expectedHash, actual });
       return match;
-    } catch (e) { return true; }
+    } catch (e) {
+      // Fail CLOSED: an unreadable blob (e.g. a revoked object URL) must not
+      // pass as verified — failing open let dead URLs render as images.
+      mediaDebug('warn', 'hash verification unreadable, rejecting', { error: String(e && e.message || e) });
+      return false;
+    }
   }
   function mediaHashes(m) {
     return uniq([
@@ -1377,6 +1451,18 @@
     for (const m of media) for (const u of mediaUrlCandidates(m, 'thumb')) out.push(u);
     return uniq(out);
   }
+  // A blob that failed verification must be evicted everywhere, not just
+  // revoked: _blobCache would otherwise re-serve the dead object URL and the
+  // persistent cache would re-serve the wrong bytes across sessions.
+  function discardRejectedBlob(found) {
+    URL.revokeObjectURL(found.blob);
+    _blobCache.delete(found.url);
+    if (mediaCacheAvailable()) {
+      openMediaCache()
+        .then((cache) => cache.delete(mediaCacheRequestUrl(found.url)))
+        .catch(() => { /* best effort */ });
+    }
+  }
   async function firstVerifiedBlob(urls, expectedHash) {
     const unique = uniq(urls);
     mediaDebug('debug', 'verified candidate list', {
@@ -1385,23 +1471,8 @@
       archiveOrg: unique.filter((u) => /archive\.org/i.test(u)),
       urls: unique
     });
-    const [priority, rest] = archiveOrgZipFirst(unique);
-    if (priority.length) {
-      mediaDebug('debug', 'verified archive.org zip priority batch', { size: priority.length, expectedHash, urls: priority });
-      const found = await firstBlobBatch(priority);
-      if (found && (!expectedHash || await verifyBlobHash(found.blob, expectedHash))) {
-        mediaDebug('debug', 'verified candidate selected from archive.org zip priority', { url: found.url, expectedHash });
-        return found;
-      }
-      if (found) {
-        mediaDebug('warn', 'archive.org zip priority hash mismatch, falling back', { url: found.url, expectedHash });
-        URL.revokeObjectURL(found.blob);
-      } else {
-        mediaDebug('debug', 'verified archive.org zip priority batch miss', { size: priority.length, expectedHash });
-      }
-    }
-    for (let i = 0; i < rest.length; i += MEDIA_BATCH_SIZE) {
-      const batch = rest.slice(i, i + MEDIA_BATCH_SIZE);
+    for (let i = 0; i < unique.length; i += MEDIA_BATCH_SIZE) {
+      const batch = unique.slice(i, i + MEDIA_BATCH_SIZE);
       mediaDebug('debug', 'verified candidate batch', { start: i, size: batch.length, expectedHash, urls: batch });
       const found = await firstBlobBatch(batch);
       if (!found) {
@@ -1413,7 +1484,7 @@
         return found;
       }
       mediaDebug('warn', 'hash mismatch, skipping candidate', { url: found.url, expectedHash });
-      URL.revokeObjectURL(found.blob);
+      discardRejectedBlob(found);
     }
     mediaDebug('warn', 'verified candidate list failed', { count: unique.length, expectedHash });
     return null;
@@ -1697,7 +1768,9 @@
           thumbFallback: !!r.thumbFallback,
           cachedAt: Date.now()
         });
-      } else if (!r) {
+      } else if (!r && !networkDisturbed()) {
+        // Persist the miss only when the network was healthy — a null during
+        // a rate-limit storm or host outage would blank the image for 24h.
         cacheSet(resolvedKey, { miss: true, cachedAt: Date.now() });
       }
       mediaDebug(r ? 'debug' : 'warn', r ? 'blob resolve ok' : 'blob resolve failed', {
@@ -2156,6 +2229,7 @@
       return added;
     };
 
+    let fullyEnumerated = false;
     for (const base of searchArchivesForBoard(board)) {
       const result = await enumerateArchiveDay(board, date, base, {
         force,
@@ -2165,16 +2239,20 @@
         cacheDebug('warn', 'archive HTML search disabled', { board, date, base });
         continue;
       }
-      if (!result.ok) {
+      if (!result.ok || result.error) {
         cacheDebug('warn', 'archive HTML search failed', { board, date, base, error: result.error });
         continue;
       }
       searched = true;
+      fullyEnumerated = true;
       mergeOps(result.ops);
     }
 
     const ops = sortedUniqueOps(all);
-    if (ops.length) cacheSet(key, ops);
+    // Only persist complete enumerations. Caching a list truncated by a
+    // mid-pagination throw (rate limit, outage) would pin a partial day
+    // forever — the read path only re-scans empty or tiny lists.
+    if (ops.length && fullyEnumerated) cacheSet(key, ops);
     return opts.includeLocal === false ? ops : mergeLocalOps(ops, board, date);
   }
 
@@ -2261,11 +2339,15 @@
   const _threadFetchCache = new Map();
   async function fetchThreadFresh(board, num) {
     let lastError = 'not found';
+    // A network/rate-limit failure on an earlier (better) archive means the
+    // result we eventually return may be a worse copy than what exists — mark
+    // it degraded so the persistent cache retries it instead of pinning it.
+    let sawFetchFailure = false;
     for (const base of threadAPIsFor(board)) {
       const url = `${base}/_/api/chan/thread/?board=${board}&num=${num}`;
       let data;
       try { data = await gmJSON(url, 12000); }
-      catch (e) { lastError = 'fetch failed'; continue; }
+      catch (e) { lastError = 'fetch failed'; sawFetchFailure = true; continue; }
       if (!data || data.error || !data[num]) {
         lastError = data && data.error ? data.error : 'not found';
         continue;
@@ -2287,7 +2369,7 @@
       const container = t.posts || {};
       for (const k of Object.keys(container)) posts.push(norm(container[k]));
       posts.sort((a, b) => a.ts - b.ts);
-      return { posts, source: base };
+      return sawFetchFailure ? { posts, source: base, degraded: true } : { posts, source: base };
     }
     return { error: lastError };
   }
@@ -4196,6 +4278,7 @@
       _postMediaCache.clear();
       _searchMediaCache.clear();
       if (mediaCacheAvailable()) {
+        _mediaCacheHandle = null; // stale after delete — reopen on next use
         caches.delete(MEDIA_CACHE_NAME).then((ok) => {
           try { console.info(`[oldchan media] cleared ${deleted} image resolution entries; persistent media cache deleted: ${ok}`); } catch (e) { /* console unavailable */ }
         });
@@ -4205,6 +4288,7 @@
     });
     GM_registerMenuCommand('Clear cached threads', () => {
       if ('caches' in window && window.caches) {
+        _threadCacheHandle = null; // stale after delete — reopen on next use
         caches.delete(THREAD_CACHE_NAME).then((ok) => {
           try { console.info(`[oldchan] persistent thread cache deleted: ${ok}`); } catch (e) { /* console unavailable */ }
         });
