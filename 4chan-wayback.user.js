@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.8.1
+// @version      0.8.2
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -577,7 +577,7 @@
     return /^https?:\/\/archive\.org\/download\/4chan-mlp-archive-\d{4}-\d{2}\/\d{4}-\d{2}\.zip\//i.test(url);
   }
   function archiveOrgDirectFileUrl(url) {
-    return /^https?:\/\/archive\.org\/download\/4chan-mlp-archive-(?:2012-06|2012-07)\/[^/]+$/i.test(url);
+    return /^https?:\/\/archive\.org\/download\/4chan-mlp-archive-(?:2012-05|2012-06)\/[^/]+$/i.test(url);
   }
   function mediaSourceKind(url) {
     if (archiveOrgZipUrl(url)) return 'archive.org zip';
@@ -1526,7 +1526,7 @@
   // archive.org's view_archive.php return noisy server-side unzip 503s.
   const IA_MLP_FIRST = Date.UTC(2012, 4, 1) / 1000;   // coverage start, 2012-05-01
   const IA_MLP_END = Date.UTC(2014, 11, 1) / 1000;    // coverage end (excl), 2014-12-01
-  const IA_MLP_DIRECT_MONTHS = new Set(['2012-06', '2012-07']);
+  const IA_MLP_DIRECT_MONTHS = new Set(['2012-05', '2012-06']);
   function archiveOrgIndexHashKeys(hash) {
     const h = String(hash || '').trim();
     if (!validMediaHash(h)) return [];
@@ -1865,64 +1865,13 @@
       }
     }
 
-    if (kind === 'thumb') {
-      r = await firstThumbMatching(local, false);
-      if (r) {
-        mediaDebug('debug', 'resolve selected thumb local after archive.org', { ...ctx, url: r.url });
-        return { ...r, thumbFallback: false };
-      }
-      r = await firstThumbMatching(api, false);
-      if (r) {
-        mediaDebug('debug', 'resolve selected thumb post API after archive.org', { ...ctx, url: r.url });
-        return { ...r, thumbFallback: false };
-      }
-    } else {
-      r = await firstFullMatching(local, expectedHash, false);
-      if (r) {
-        mediaDebug('debug', 'resolve selected full local after archive.org', { ...ctx, url: r.url });
-        return r;
-      }
-      r = await firstFullMatching(api, primaryHash, false);
-      if (r) {
-        mediaDebug('debug', 'resolve selected full post API after archive.org', { ...ctx, url: r.url });
-        return r;
-      }
-    }
-
-    if (kind === 'thumb') {
-      r = await firstThumbMatching(searched, false);
-      if (r) {
-        mediaDebug('debug', 'resolve selected thumb search after archive.org', { ...ctx, url: r.url });
-        return { ...r, thumbFallback: false };
-      }
-      r = primaryHash
-        ? await firstVerifiedBlob(mediaUrlsMatching(fullUrls(searchedSeeds), false), primaryHash)
-        : await firstBlob(mediaUrlsMatching(fullUrls(searchedSeeds), false));
-      if (r) {
-        mediaDebug('debug', 'resolve selected thumb full-fallback after archive.org', { ...ctx, url: r.url });
-        return { ...r, thumbFallback: false };
-      }
-    } else {
-      r = await firstFullMatching(searched, primaryHash, false);
-      if (r) {
-        mediaDebug('debug', 'resolve selected full search after archive.org', { ...ctx, url: r.url });
-        return r;
-      }
-      r = await firstThumbMatching(searchedSeeds, false);
-      if (r) {
-        mediaDebug('warn', 'resolve selected thumb fallback for full after archive.org', { ...ctx, url: r.url });
-        return r;
-      }
-    }
-
-    if (BOORU_BOARDS.has(engine.board) && primaryHash) {
-      r = await booruMd5Search(primaryHash);
-      if (r) {
-        mediaDebug('debug', 'resolve selected booru md5 match', { ...ctx, url: r.url });
-        return r;
-      }
-    }
-    mediaDebug('warn', 'resolve miss', ctx);
+    mediaDebug('warn', 'resolve miss, archive.org-only mode', {
+      ...ctx,
+      hash: primaryHash,
+      localCount: local.length,
+      apiCount: api.length,
+      searchCount: searched.length
+    });
     return null;
   }
   async function resolvePostMediaBlob(p, kind) {
@@ -2276,7 +2225,7 @@
     `actp:v1:${board}:${date}:${base.replace(/^https?:\/\//, '').replace(/[^a-z0-9]+/gi, '_')}:${page}`;
   const threadCacheKey = (board, num) => `thr:v5:${board}:${num}`;
   const threadSummaryCacheKey = (board, num) => `thrs:v1:${board}:${num}`;
-  const mediaResolveCacheKey = (board, num, kind) => `media:v9:${board}:${num}:${kind}`;
+  const mediaResolveCacheKey = (board, num, kind) => `media:v10:${board}:${num}:${kind}`;
   const localPostCacheKey = (board) => `localposts:v1:${board}`;
   const postIdentityCacheKey = () => 'postIdentity:v1';
 
