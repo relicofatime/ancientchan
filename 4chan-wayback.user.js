@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.7.7
+// @version      0.7.8
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -509,12 +509,29 @@
   const MEDIA_TIMEOUT_MS = 5000;
   const MEDIA_ARCHIVE_ORG_TIMEOUT_MS = 12000;
   const MEDIA_BATCH_SIZE = 8;
+  const MLP_ARCHIVE_ORG_FIRST_CUTOFF_MS = Date.UTC(2015, 0, 1);
   const _hostFails = new Map();
   const HOST_FAIL_THRESHOLD = 4;
   const HOST_FAIL_WINDOW_MS = 60000;
   function mediaHost(url) { try { return new URL(url).host; } catch (e) { return ''; } }
   function archiveOrgMedia(url) {
     return /\b(?:web\.)?archive\.org\b/i.test(mediaHost(url));
+  }
+  function replayDateMs() {
+    const m = String(CONFIG.date || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!m) return NaN;
+    return Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  }
+  function mlpArchiveOrgFirstRequired(board = engine.board) {
+    const d = replayDateMs();
+    return board === 'mlp' && Number.isFinite(d) && d < MLP_ARCHIVE_ORG_FIRST_CUTOFF_MS;
+  }
+  function mediaCandidateBatchSize() {
+    return mlpArchiveOrgFirstRequired() ? 1 : MEDIA_BATCH_SIZE;
+  }
+  function mediaResolveConcurrencyLimit() {
+    const configured = Math.max(1, CONFIG.mediaResolveConcurrency || 1);
+    return mlpArchiveOrgFirstRequired() ? 1 : configured;
   }
   function mediaFetchTimeout(url) {
     return archiveOrgMedia(url) ? MEDIA_ARCHIVE_ORG_TIMEOUT_MS : MEDIA_TIMEOUT_MS;
@@ -868,7 +885,7 @@
   const _mediaTaskQueue = [];
   let _mediaTaskActive = 0;
   function drainMediaTasks() {
-    const max = Math.max(1, CONFIG.mediaResolveConcurrency || 1);
+    const max = mediaResolveConcurrencyLimit();
     while (_mediaTaskActive < max && _mediaTaskQueue.length) {
       const task = _mediaTaskQueue.shift();
       _mediaTaskActive++;
@@ -1172,11 +1189,10 @@
     return firstSuccess(urls.map((u) => gmBlobURL(u).then((b) => b ? { blob: b, url: u } : null)));
   }
 
-  // Resolve to the first candidate that actually loads. Candidates are probed
-  // in small parallel batches so one dead host cannot stall the whole chain.
-  // archive.org candidates race inside their batch like everyone else —
-  // serializing them first stalled every image behind archive.org's slow
-  // misses whenever a month's item wasn't (yet) uploaded.
+  // Resolve to the first candidate that actually loads. Candidates are normally
+  // probed in small parallel batches so one dead host cannot stall the whole
+  // chain. /mlp/ before 2015 is stricter: batch size 1, with archive.org tried
+  // before any mirror image host.
   async function firstBlob(urls) {
     const unique = uniq(urls);
     if (!unique.length) {
@@ -1184,8 +1200,9 @@
       return null;
     }
     mediaDebug('debug', 'candidate list', { count: unique.length, urls: unique });
-    for (let i = 0; i < unique.length; i += MEDIA_BATCH_SIZE) {
-      const batch = unique.slice(i, i + MEDIA_BATCH_SIZE);
+    const batchSize = mediaCandidateBatchSize();
+    for (let i = 0; i < unique.length; i += batchSize) {
+      const batch = unique.slice(i, i + batchSize);
       mediaDebug('debug', 'candidate batch', { start: i, size: batch.length, urls: batch });
       const found = await firstBlobBatch(batch);
       if (found) {
@@ -1513,7 +1530,7 @@
     return IA_MLP_DIRECT_MONTHS.has(ym) ? [directUrl, zipUrl] : [zipUrl];
   }
   async function archiveOrgIndexedMedia(board, media) {
-    if (board !== 'mlp' || !media || !media.length) return [];
+    if (!mlpArchiveOrgFirstRequired(board) || !media || !media.length) return [];
     const hashKeys = uniq(media.flatMap(mediaHashes).flatMap(archiveOrgIndexHashKeys));
     if (!hashKeys.length) return [];
     const index = await loadArchiveOrgMlpIndex();
@@ -1545,7 +1562,7 @@
     return out;
   }
   function archiveOrgDownloadCandidates(board, file) {
-    if (board !== 'mlp') return [];
+    if (!mlpArchiveOrgFirstRequired(board)) return [];
     const m = String(file || '').match(/^(\d{10,13})\.[a-z0-9]+$/i);
     if (!m) {
       mediaDebug('debug', 'archive.org candidate skipped', { board, file, reason: 'filename is not a 4chan timestamp media name' });
@@ -1672,8 +1689,9 @@
       archiveOrg: unique.filter((u) => /archive\.org/i.test(u)),
       urls: unique
     });
-    for (let i = 0; i < unique.length; i += MEDIA_BATCH_SIZE) {
-      const batch = unique.slice(i, i + MEDIA_BATCH_SIZE);
+    const batchSize = mediaCandidateBatchSize();
+    for (let i = 0; i < unique.length; i += batchSize) {
+      const batch = unique.slice(i, i + batchSize);
       mediaDebug('debug', 'verified candidate batch', { start: i, size: batch.length, expectedHash, urls: batch });
       const found = await firstBlobBatch(batch);
       if (!found) {
@@ -1699,6 +1717,24 @@
   async function firstThumb(media) {
     const r = await firstBlob(thumbUrls(media));
     return r ? { ...r, thumbFallback: true } : null;
+  }
+  function mediaUrlsMatching(urls, wantArchiveOrg) {
+    return uniq(urls).filter((u) => archiveOrgMedia(u) === wantArchiveOrg);
+  }
+  async function firstFullMatching(media, expectedHash, wantArchiveOrg) {
+    const urls = mediaUrlsMatching(fullUrls(media), wantArchiveOrg);
+    const r = expectedHash ? await firstVerifiedBlob(urls, expectedHash) : await firstBlob(urls);
+    return r ? { ...r, thumbFallback: false } : null;
+  }
+  async function firstThumbMatching(media, wantArchiveOrg) {
+    const r = await firstBlob(mediaUrlsMatching(thumbUrls(media), wantArchiveOrg));
+    return r ? { ...r, thumbFallback: true } : null;
+  }
+  async function firstArchiveOrgFull(board, media, expectedHash) {
+    const indexed = await archiveOrgIndexedMedia(board, media);
+    let r = await firstFull(indexed, expectedHash);
+    if (r) return r;
+    return firstFullMatching(media, expectedHash, true);
   }
   const FOURCHAN_404_IMAGES = [
     'Angelguy.png',
@@ -1790,6 +1826,92 @@
     }
     return null;
   }
+  async function resolveMlpArchiveOrgFirstMedia(p, kind, ctx, local, expectedHash, apiP) {
+    const api = await apiP;
+    const apiHash = expectedHash || (api[0] && (api[0].rawHash || api[0].hash)) || '';
+    const primarySeeds = [...local, ...api];
+    const primaryHash = apiHash || expectedHash;
+    mediaDebug(api.length ? 'debug' : 'warn', `resolve ${kind} post API candidates`, { ...ctx, count: api.length, archiveOrgFirst: true });
+
+    let r = await firstArchiveOrgFull(engine.board, primarySeeds, primaryHash);
+    if (r) {
+      mediaDebug('debug', `resolve selected ${kind} archive.org first`, { ...ctx, url: r.url });
+      return { ...r, thumbFallback: false };
+    }
+
+    const searched = primaryHash ? [] : await searchArchiveMedia(engine.board, primarySeeds);
+    if (!primaryHash || searched.length) {
+      mediaDebug(searched.length ? 'debug' : 'warn', `resolve ${kind} search candidates`, { ...ctx, count: searched.length, archiveOrgFirst: true });
+    }
+    const searchedSeeds = [...primarySeeds, ...searched];
+    if (searched.length) {
+      r = await firstArchiveOrgFull(engine.board, searchedSeeds, primaryHash);
+      if (r) {
+        mediaDebug('debug', `resolve selected ${kind} archive.org first search`, { ...ctx, url: r.url });
+        return { ...r, thumbFallback: false };
+      }
+    }
+
+    if (kind === 'thumb') {
+      r = await firstThumbMatching(local, false);
+      if (r) {
+        mediaDebug('debug', 'resolve selected thumb local after archive.org', { ...ctx, url: r.url });
+        return { ...r, thumbFallback: false };
+      }
+      r = await firstThumbMatching(api, false);
+      if (r) {
+        mediaDebug('debug', 'resolve selected thumb post API after archive.org', { ...ctx, url: r.url });
+        return { ...r, thumbFallback: false };
+      }
+    } else {
+      r = await firstFullMatching(local, expectedHash, false);
+      if (r) {
+        mediaDebug('debug', 'resolve selected full local after archive.org', { ...ctx, url: r.url });
+        return r;
+      }
+      r = await firstFullMatching(api, primaryHash, false);
+      if (r) {
+        mediaDebug('debug', 'resolve selected full post API after archive.org', { ...ctx, url: r.url });
+        return r;
+      }
+    }
+
+    if (kind === 'thumb') {
+      r = await firstThumbMatching(searched, false);
+      if (r) {
+        mediaDebug('debug', 'resolve selected thumb search after archive.org', { ...ctx, url: r.url });
+        return { ...r, thumbFallback: false };
+      }
+      r = primaryHash
+        ? await firstVerifiedBlob(mediaUrlsMatching(fullUrls(searchedSeeds), false), primaryHash)
+        : await firstBlob(mediaUrlsMatching(fullUrls(searchedSeeds), false));
+      if (r) {
+        mediaDebug('debug', 'resolve selected thumb full-fallback after archive.org', { ...ctx, url: r.url });
+        return { ...r, thumbFallback: false };
+      }
+    } else {
+      r = await firstFullMatching(searched, primaryHash, false);
+      if (r) {
+        mediaDebug('debug', 'resolve selected full search after archive.org', { ...ctx, url: r.url });
+        return r;
+      }
+      r = await firstThumbMatching(searchedSeeds, false);
+      if (r) {
+        mediaDebug('warn', 'resolve selected thumb fallback for full after archive.org', { ...ctx, url: r.url });
+        return r;
+      }
+    }
+
+    if (BOORU_BOARDS.has(engine.board) && primaryHash) {
+      r = await booruMd5Search(primaryHash);
+      if (r) {
+        mediaDebug('debug', 'resolve selected booru md5 match', { ...ctx, url: r.url });
+        return r;
+      }
+    }
+    mediaDebug('warn', 'resolve miss', ctx);
+    return null;
+  }
   async function resolvePostMediaBlob(p, kind) {
     if (!p || !p.num) return null;
     const ctx = { board: engine.board, num: p.num, kind };
@@ -1801,6 +1923,9 @@
       local: local.map((m) => ({ full: m && m.full, thumb: m && m.thumb, fname: m && m.fname, hash: m && m.hash }))
     });
     const apiP = postArchiveMedia(engine.board, p.num);
+    if (mlpArchiveOrgFirstRequired(engine.board)) {
+      return resolveMlpArchiveOrgFirstMedia(p, kind, ctx, local, expectedHash, apiP);
+    }
 
     if (kind === 'thumb') {
       const indexedLocal = await archiveOrgIndexedMedia(engine.board, local);
@@ -2133,7 +2258,7 @@
     `actp:v1:${board}:${date}:${base.replace(/^https?:\/\//, '').replace(/[^a-z0-9]+/gi, '_')}:${page}`;
   const threadCacheKey = (board, num) => `thr:v5:${board}:${num}`;
   const threadSummaryCacheKey = (board, num) => `thrs:v1:${board}:${num}`;
-  const mediaResolveCacheKey = (board, num, kind) => `media:v7:${board}:${num}:${kind}`;
+  const mediaResolveCacheKey = (board, num, kind) => `media:v8:${board}:${num}:${kind}`;
   const localPostCacheKey = (board) => `localposts:v1:${board}`;
   const postIdentityCacheKey = () => 'postIdentity:v1';
 
