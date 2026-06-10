@@ -260,6 +260,25 @@ touch "$UPLOAD_LOG"
 BUCKET_TOTAL=$(find "$SORTED_DIR" -mindepth 1 -maxdepth 1 -type d | wc -l)
 BUCKET_NUM=0
 
+# ia rejects file arguments placed AFTER --metadata flags ("unrecognized
+# arguments"), and xargs always appends its args at the end of the command.
+# So we feed the file list (NUL-delimited, on stdin) through a wrapper that
+# puts the files BEFORE the metadata. Args: item_id, title, description.
+ia_upload_files() {
+  IA_ITEM="$1" IA_TITLE="$2" IA_DESC="$3" \
+  xargs -0 -r -n 2000 sh -c '
+    ia upload "$IA_ITEM" "$@" \
+      --metadata="collection:opensource" \
+      --metadata="mediatype:image" \
+      --metadata="title:$IA_TITLE" \
+      --metadata="description:$IA_DESC" \
+      --metadata="subject:4chan;mlp;archive;imageboard" \
+      --metadata="creator:anonymous" \
+      --retries=5 \
+      --no-derive
+  ' sh
+}
+
 upload_item() {
   local item_id="$1"
   local dir="$2"
@@ -277,17 +296,11 @@ upload_item() {
   log "  Uploading $item_id ($fcount files)..."
 
   # Upload from inside the directory so remote paths are just filenames.
-  # Use find+xargs to avoid ARG_MAX with large directories.
+  # Files (NUL-delimited) are piped in so they land before the metadata flags.
   if (cd "$dir" && find . -maxdepth 1 -type f -printf '%f\0' | \
-      xargs -0 -n 2000 ia upload "$item_id" \
-        --metadata="collection:opensource" \
-        --metadata="mediatype:image" \
-        --metadata="title:4chan /mlp/ archived images ($bucket_label)" \
-        --metadata="description:Archived full-size images from 4chan /mlp/, $bucket_label. Part of the $COLLECTION collection." \
-        --metadata="subject:4chan;mlp;archive;imageboard" \
-        --metadata="creator:anonymous" \
-        --retries=5 \
-        --no-derive); then
+      ia_upload_files "$item_id" \
+        "4chan /mlp/ archived images ($bucket_label)" \
+        "Archived full-size images from 4chan /mlp/, $bucket_label. Part of the $COLLECTION collection."); then
     echo "$item_id OK $fcount" >> "$UPLOAD_LOG"
     log "  $item_id done."
     return 0
@@ -336,16 +349,12 @@ process_bucket() {
       fi
       log "  Uploading $part_id ($local_count files)..."
 
-      # Upload files listed in the manifest
-      if (cd "$bucket_dir" && xargs -a "$filelist" -d '\n' -n 2000 ia upload "$part_id" \
-          --metadata="collection:opensource" \
-          --metadata="mediatype:image" \
-          --metadata="title:4chan /mlp/ archived images ($bucket, part $part_num)" \
-          --metadata="description:Archived full-size images from 4chan /mlp/, $bucket part $part_num of $parts. Part of the $COLLECTION collection." \
-          --metadata="subject:4chan;mlp;archive;imageboard" \
-          --metadata="creator:anonymous" \
-          --retries=5 \
-          --no-derive); then
+      # Files listed in the manifest (newline → NUL) piped in so they land
+      # before the metadata flags.
+      if (cd "$bucket_dir" && tr '\n' '\0' < "$filelist" | \
+          ia_upload_files "$part_id" \
+            "4chan /mlp/ archived images ($bucket, part $part_num)" \
+            "Archived full-size images from 4chan /mlp/, $bucket part $part_num of $parts. Part of the $COLLECTION collection."); then
         echo "$part_id OK $local_count" >> "$UPLOAD_LOG"
         log "  $part_id done."
       else
