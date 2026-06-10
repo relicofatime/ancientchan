@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.7.4
+// @version      0.7.5
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -309,7 +309,8 @@
   // Generic 5xx responses are not rate limits (desuarchive often clears a
   // transient 503 on an immediate refresh) but they do get a short shared
   // pause so concurrent workers don't collectively hammer a struggling host.
-  const _rateLimits = new Map(); // host → { until }
+  const _rateLimits = new Map(); // host -> { until }, true 429/explicit throttle only
+  const _hostPauses = new Map();  // host -> { until }, short generic 5xx backoff, not a rate-limit verdict
   // Retrying a host that just said "slow down" is the worst response when
   // mirror archives exist — one retry, then throw so callers fail over.
   const RATE_LIMIT_MAX_RETRIES = 1;
@@ -362,14 +363,15 @@
     const ms = ts - Date.now();
     return ms > 0 && ms <= 120000 ? ms : 0;
   }
-  function isRateLimitResponse(r) {
-    if (r.status === 429) return true;
+  function rateLimitResponseReason(r) {
+    if (r.status === 429) return 'http 429';
     // Cloudflare-style "you are being rate limited" pages come back 403.
     // 5xx pages mentioning rate limiting stay on the transient path — a
     // server error page quoting the words is not a limiter verdict.
-    if (r.status !== 403) return false;
+    if (r.status !== 403) return '';
     const text = String(r.responseText || '').slice(0, 2048);
-    return /\b(?:too many requests|rate[-\s]?limit(?:ed|ing)?|throttled)\b/i.test(text);
+    const m = /\b(?:too many requests|rate[-\s]?limit(?:ed|ing)?|throttled)\b/i.exec(text);
+    return m ? `http 403 body matched "${m[0].slice(0, 80)}"` : '';
   }
   function transientRetryMs(responseHeaders, attempt) {
     const backoff = Math.min(750 * Math.pow(2, attempt), 3000);
@@ -380,25 +382,27 @@
     return status === 500 || status === 502 || status === 503 || status === 504;
   }
 
-  function extendHostCooldown(host, ms) {
-    const prev = _rateLimits.get(host);
+  function extendCooldown(map, host, ms) {
+    const prev = map.get(host);
     const until = Date.now() + ms;
-    if (!prev || prev.until < until) _rateLimits.set(host, { until });
+    if (!prev || prev.until < until) map.set(host, { until });
   }
   function noteRateLimit(url, responseHeaders, attempt) {
     // Server's Retry-After or exponential 5s/10s/20s/40s — and jitter ON TOP
     // either way, so the herd of parallel requests doesn't share one wake-up
     // instant and re-trip the limiter in lockstep.
     const base = retryAfterMs(responseHeaders) || Math.min(5000 * Math.pow(2, attempt), 60000);
-    extendHostCooldown(mediaHost(url), base + Math.floor(Math.random() * 4000));
+    extendCooldown(_rateLimits, mediaHost(url), base + Math.floor(Math.random() * 4000));
     updateRateLimitUI();
   }
   // Cooldowns are never deleted on success — a lone request finishing cannot
   // vouch for a host other waiters just saw 429; entries simply lapse.
-  function hostCooldownRemaining(host) {
-    const rl = _rateLimits.get(host);
+  function cooldownRemaining(map, host) {
+    const rl = map.get(host);
     return rl ? Math.max(0, rl.until - Date.now()) : 0;
   }
+  function rateLimitRemaining(host) { return cooldownRemaining(_rateLimits, host); }
+  function hostPauseRemaining(host) { return cooldownRemaining(_hostPauses, host); }
 
   // Self-rearming countdown: re-queries the span every tick so it survives
   // renderShell rebuilding the bar, and stops on its own when no cooldown is
@@ -432,10 +436,14 @@
         // Wait out any shared cooldown — with our own jitter so waiters
         // trickle back instead of stampeding — but never past this request's
         // budget: throwing early lets callers fail over to another archive.
-        const cooldown = hostCooldownRemaining(host);
+        const rateLimitWait = rateLimitRemaining(host);
+        const hostPauseWait = hostPauseRemaining(host);
+        const cooldown = Math.max(rateLimitWait, hostPauseWait);
         if (cooldown > 0) {
           const wait = cooldown + Math.floor(Math.random() * 2500);
-          if (Date.now() + wait > deadline) throw new Error('Rate limited: ' + url);
+          if (Date.now() + wait > deadline) {
+            throw new Error((rateLimitWait >= hostPauseWait ? 'Rate limited' : 'Host temporarily unavailable') + ': ' + url);
+          }
           await sleep(wait);
           continue; // cooldown may have been extended while we slept
         }
@@ -450,7 +458,16 @@
             ontimeout: () => reject(new Error('Timeout: ' + url))
           });
         });
-        if (isRateLimitResponse(r)) {
+        const rateLimitReason = rateLimitResponseReason(r);
+        if (rateLimitReason) {
+          mediaDebug('warn', 'api rate-limit detected', {
+            source: mediaSourceKind(url),
+            host,
+            status: r.status || 0,
+            reason: rateLimitReason,
+            headers: mediaHeaderSummary(r.responseHeaders || ''),
+            url
+          });
           if (rlAttempts >= RATE_LIMIT_MAX_RETRIES) throw statusError(r, url);
           noteRateLimit(url, r.responseHeaders, rlAttempts);
           rlAttempts++;
@@ -459,7 +476,7 @@
         if (isTransientStatus(r.status)) {
           // Short shared pause: every worker hitting this host backs off a
           // beat together instead of independently hammering a 503ing host.
-          extendHostCooldown(host, 1500 + Math.floor(Math.random() * 1000));
+          extendCooldown(_hostPauses, host, 1500 + Math.floor(Math.random() * 1000));
           if (transientAttempts >= TRANSIENT_STATUS_MAX_RETRIES) throw statusError(r, url);
           await sleep(transientRetryMs(r.responseHeaders, transientAttempts));
           transientAttempts++;
@@ -514,6 +531,9 @@
     const now = Date.now();
     for (const rl of _rateLimits.values()) {
       if (rl.until > now) return true;
+    }
+    for (const pause of _hostPauses.values()) {
+      if (pause.until > now) return true;
     }
     for (const fails of _hostFails.values()) {
       if (fails.filter((t) => now - t < HOST_FAIL_WINDOW_MS).length >= HOST_FAIL_THRESHOLD) return true;
