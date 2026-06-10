@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.8.0
+// @version      0.8.1
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -2265,6 +2265,11 @@
   const indexCacheKey = (board, date) => `idx:v8:${board}:${date}`;
   const catalogCacheKey = (board, date) =>
     `catalog:v9:${board}:${date}:active${CONFIG.catalogActivityThreadTarget}:d${CONFIG.catalogActivityMaxDays}`;
+  function cachedCatalogOps(board, date) {
+    const cached = cacheGet(catalogCacheKey(board, date));
+    const ops = Array.isArray(cached) ? cached : (cached && Array.isArray(cached.ops) ? cached.ops : null);
+    return ops && ops.length ? mergeLocalCatalogOps(ops, board, date) : [];
+  }
   const indexPageCacheKey = (board, date, base, page) =>
     `idxp:v1:${board}:${date}:${base.replace(/^https?:\/\//, '').replace(/[^a-z0-9]+/gi, '_')}:${page}`;
   const activityPageCacheKey = (board, date, base, page) =>
@@ -2953,7 +2958,7 @@
           engine.catalogHydrateDone++;
           if (engine.catalogHydrateDone % noteEvery === 0 || engine.catalogHydrateDone >= engine.catalogHydrateTotal) {
             updateCatalogSyncNoteOnly();
-            scheduleBoardUpdate();
+            if (engine.catalogView) scheduleBoardUpdate();
           }
           if (CONFIG.catalogHydrateYieldMs) await sleep(CONFIG.catalogHydrateYieldMs);
         }
@@ -4602,12 +4607,15 @@
     ensureAnchor();
     startTimer();
 
-    const onProgress = (partial) => {
-      if (token !== engine.catalogToken || !partial.length) return;
-      engine.ops = partial;
+    const cachedOps = cachedCatalogOps(engine.board, CONFIG.date);
+    if (cachedOps.length) {
+      engine.ops = cachedOps;
+      loadCachedThreadSummariesIntoMemory(engine.board, engine.ops);
+      loadCachedThreadsIntoMemory(engine.board, engine.ops);
       refreshCurrentBoardSnapshot();
-    };
-    const ops = await enumerateCatalogCandidates(engine.board, CONFIG.date, { atClock: engine.clock, onProgress });
+    }
+
+    const ops = await enumerateCatalogCandidates(engine.board, CONFIG.date, { atClock: engine.clock });
     if (token !== engine.catalogToken) return;
     engine.ops = ops;
 
