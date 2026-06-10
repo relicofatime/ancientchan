@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.6.7
+// @version      0.6.8
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -299,34 +299,77 @@
   function statusError(r, url) {
     return new Error(`HTTP ${r.status || 0}: ${url}`);
   }
-  function gmJSON(url, timeout = 30000) {
-    return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
-        method: 'GET', url, timeout,
-        headers: { 'Accept': 'application/json' },
-        onload: (r) => {
-          if (!okStatus(r.status)) { reject(statusError(r, url)); return; }
-          try { resolve(JSON.parse(r.responseText)); }
-          catch (e) { reject(new Error('Bad JSON from ' + url)); }
-        },
-        onerror: () => reject(new Error('Network error: ' + url)),
-        ontimeout: () => reject(new Error('Timeout: ' + url))
-      });
-    });
+  // ── Rate-limit detection & backoff ─────────────────────────────────────
+  // Archives (desuarchive especially) 429 bursts of API calls. Instead of
+  // treating that as "no data" and rendering an empty board, back off per
+  // host, hold new requests to that host until the cooldown passes, and
+  // retry. Status is shown in the control bar (#wb-ratelimit).
+  const _rateLimits = new Map(); // host → { until }
+  const RATE_LIMIT_MAX_RETRIES = 4;
+  let _rlTimer = null;
+
+  function noteRateLimit(url, responseHeaders, attempt) {
+    const h = mediaHost(url);
+    // Honor Retry-After when sane, else exponential: 5s, 10s, 20s, 40s.
+    let ms = Math.min(5000 * Math.pow(2, attempt), 60000);
+    const m = /(?:^|\n)retry-after:\s*(\d+)/i.exec(responseHeaders || '');
+    if (m && Number(m[1]) > 0 && Number(m[1]) <= 120) ms = Number(m[1]) * 1000;
+    const prev = _rateLimits.get(h);
+    const until = Date.now() + ms;
+    _rateLimits.set(h, { until: prev ? Math.max(prev.until, until) : until });
+    updateRateLimitUI();
   }
-  function gmText(url) {
-    return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
-        method: 'GET', url, timeout: 40000,
-        onload: (r) => {
-          if (!okStatus(r.status)) { reject(statusError(r, url)); return; }
-          resolve(r.responseText);
-        },
-        onerror: () => reject(new Error('Network error: ' + url)),
-        ontimeout: () => reject(new Error('Timeout: ' + url))
-      });
-    });
+  function clearRateLimit(url) {
+    if (_rateLimits.delete(mediaHost(url))) updateRateLimitUI();
   }
+  function rateLimitPause(url) {
+    const rl = _rateLimits.get(mediaHost(url));
+    const waitMs = rl ? rl.until - Date.now() : 0;
+    return waitMs > 0 ? new Promise((res) => setTimeout(res, waitMs)) : Promise.resolve();
+  }
+  function updateRateLimitUI() {
+    const span = $('#wb-ratelimit');
+    if (!span) return;
+    let worst = null;
+    for (const [host, rl] of _rateLimits) {
+      if (rl.until > Date.now() && (!worst || rl.until > worst.until)) worst = { host, until: rl.until };
+    }
+    if (!worst) {
+      span.textContent = '';
+      if (_rlTimer) { clearInterval(_rlTimer); _rlTimer = null; }
+      return;
+    }
+    const secs = Math.max(1, Math.ceil((worst.until - Date.now()) / 1000));
+    span.textContent = `rate limited by ${worst.host} — retrying in ${secs}s`;
+    if (!_rlTimer) _rlTimer = setInterval(updateRateLimitUI, 1000);
+  }
+
+  async function gmGet(url, { timeout = 30000, json = false } = {}) {
+    for (let attempt = 0; ; attempt++) {
+      await rateLimitPause(url);
+      const r = await new Promise((resolve, reject) => {
+        GM_xmlhttpRequest({
+          method: 'GET', url, timeout,
+          headers: json ? { 'Accept': 'application/json' } : undefined,
+          onload: resolve,
+          onerror: () => reject(new Error('Network error: ' + url)),
+          ontimeout: () => reject(new Error('Timeout: ' + url))
+        });
+      });
+      if (r.status === 429 || r.status === 503) {
+        if (attempt >= RATE_LIMIT_MAX_RETRIES) throw statusError(r, url);
+        noteRateLimit(url, r.responseHeaders, attempt);
+        continue; // loops back through rateLimitPause
+      }
+      if (!okStatus(r.status)) throw statusError(r, url);
+      clearRateLimit(url);
+      if (!json) return r.responseText;
+      try { return JSON.parse(r.responseText); }
+      catch (e) { throw new Error('Bad JSON from ' + url); }
+    }
+  }
+  function gmJSON(url, timeout = 30000) { return gmGet(url, { timeout, json: true }); }
+  function gmText(url) { return gmGet(url, { timeout: 40000 }); }
   const MEDIA_TIMEOUT_MS = 5000;
   const MEDIA_BATCH_SIZE = 8;
   const _hostFails = new Map();
@@ -3335,6 +3378,7 @@
       el('label', {}, ' design ', designSel),
       el('label', {}, ' catalog ', catalogSortSel),
       pause, hide,
+      el('span', { id: 'wb-ratelimit' }, ''),
       el('span', { id: 'wb-clock' }, '')
     );
     return bar;
@@ -3886,6 +3930,8 @@
     #wb-bar label { color:var(--wb-text); }
     #wb-bar input, #wb-bar select, #wb-bar button { font-size:12px; font-family:arial,helvetica,sans-serif; }
     #wb-bar #wb-clock { margin-left:auto; font-weight:bold; color:var(--wb-text); }
+    #wb-bar #wb-ratelimit { color:#c00; font-weight:bold; }
+    #wb-bar #wb-ratelimit:empty { display:none; }
 
     /* real 4chan top chrome: board list + nav links + relocated banner */
     #wb-chrome { padding:2px 0 0; }
