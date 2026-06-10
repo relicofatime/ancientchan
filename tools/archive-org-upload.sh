@@ -58,7 +58,9 @@ log "archive.org configured."
 # ─── Step 2: Download torrent ────────────────────────────────────────
 log "=== Step 2: Download torrent ==="
 mkdir -p "$TORRENT_DIR"
-if [ -f "$WORK/.torrent-done" ]; then
+if [ -n "${SKIP_TORRENT:-}" ]; then
+  log "SKIP_TORRENT set — skipping torrent download (using whatever is in $WORK/extracted)."
+elif [ -f "$WORK/.torrent-done" ]; then
   log "Torrent already downloaded, skipping."
 else
   log "Starting torrent download (this will take hours)..."
@@ -75,7 +77,9 @@ log "=== Step 3: Extract .car archives ==="
 EXTRACT_DIR="$WORK/extracted"
 CAR_COUNT=$(find "$TORRENT_DIR" -name "*.car" -type f 2>/dev/null | wc -l)
 
-if [ "$CAR_COUNT" -gt 0 ]; then
+if [ -n "${SKIP_TORRENT:-}" ]; then
+  log "SKIP_TORRENT set — skipping .car extraction (torrent files may be incomplete)."
+elif [ "$CAR_COUNT" -gt 0 ]; then
   if [ -f "$WORK/.extract-done" ]; then
     log "Already extracted, skipping."
   else
@@ -257,13 +261,15 @@ upload_item() {
   local dir="$2"
   local bucket_label="$3"
 
-  if grep -q "^${item_id} OK$" "$UPLOAD_LOG" 2>/dev/null; then
-    log "  $item_id already uploaded, skipping."
-    return 0
-  fi
-
   local fcount
   fcount=$(find "$dir" -maxdepth 1 -type f | wc -l)
+
+  # Skip only if uploaded with the same file count — a bucket can gain files
+  # when a second source (heinessen, torrent) adds images to the same month.
+  if grep -q "^${item_id} OK ${fcount}$" "$UPLOAD_LOG" 2>/dev/null; then
+    log "  $item_id already uploaded ($fcount files), skipping."
+    return 0
+  fi
   log "  Uploading $item_id ($fcount files)..."
 
   # Upload from inside the directory so remote paths are just filenames.
@@ -278,7 +284,7 @@ upload_item() {
         --metadata="creator:anonymous" \
         --retries=5 \
         --no-derive); then
-    echo "$item_id OK" >> "$UPLOAD_LOG"
+    echo "$item_id OK $fcount" >> "$UPLOAD_LOG"
     log "  $item_id done."
     return 0
   else
@@ -317,12 +323,11 @@ for bucket_dir in "$SORTED_DIR"/*/; do
       part_num=$((part_num + 1))
       part_id="${COLLECTION}-${bucket}-part${part_num}"
 
-      if grep -q "^${part_id} OK$" "$UPLOAD_LOG" 2>/dev/null; then
-        log "  $part_id already uploaded, skipping."
+      local_count=$(wc -l < "$filelist")
+      if grep -q "^${part_id} OK ${local_count}$" "$UPLOAD_LOG" 2>/dev/null; then
+        log "  $part_id already uploaded ($local_count files), skipping."
         continue
       fi
-
-      local_count=$(wc -l < "$filelist")
       log "  Uploading $part_id ($local_count files)..."
 
       # Upload files listed in the manifest
@@ -335,7 +340,7 @@ for bucket_dir in "$SORTED_DIR"/*/; do
           --metadata="creator:anonymous" \
           --retries=5 \
           --no-derive); then
-        echo "$part_id OK" >> "$UPLOAD_LOG"
+        echo "$part_id OK $local_count" >> "$UPLOAD_LOG"
         log "  $part_id done."
       else
         echo "$part_id FAILED" >> "$UPLOAD_LOG"
@@ -349,8 +354,10 @@ done
 
 # ─── Step 9: Upload MD5 index ───────────────────────────────────────
 log "=== Step 9: Upload MD5 index ==="
-if grep -q "^${COLLECTION}-index OK$" "$UPLOAD_LOG" 2>/dev/null; then
-  log "Index already uploaded, skipping."
+# Keyed on the index file's own hash: re-uploads whenever the index changes.
+INDEX_MD5=$(md5sum "$INDEX_FILE" | cut -d' ' -f1)
+if grep -q "^${COLLECTION}-index OK ${INDEX_MD5}$" "$UPLOAD_LOG" 2>/dev/null; then
+  log "Index already uploaded (unchanged), skipping."
 else
   ia upload "${COLLECTION}-index" "$INDEX_FILE" \
     --metadata="collection:opensource" \
@@ -359,7 +366,7 @@ else
     --metadata="description:JSON mapping of base64 MD5 hashes to archive.org file paths. Keys are base64-encoded MD5 hashes (matching desuarchive media_hash). Values are 'YYYY-MM/filename' paths. Used by ancientchan userscript to resolve dead images." \
     --metadata="subject:4chan;mlp;archive;index" \
     --retries=5 \
-    && echo "${COLLECTION}-index OK" >> "$UPLOAD_LOG"
+    && echo "${COLLECTION}-index OK ${INDEX_MD5}" >> "$UPLOAD_LOG"
   log "Index uploaded."
 fi
 
@@ -370,7 +377,7 @@ log "  UPLOAD COMPLETE"
 log "════════════════════════════════════════════════════"
 echo ""
 
-OK_COUNT=$(grep -c " OK$" "$UPLOAD_LOG" 2>/dev/null || echo 0)
+OK_COUNT=$(grep -c " OK " "$UPLOAD_LOG" 2>/dev/null || echo 0)
 FAIL_COUNT=$(grep -c " FAILED$" "$UPLOAD_LOG" 2>/dev/null || echo 0)
 log "Results: $OK_COUNT succeeded, $FAIL_COUNT failed"
 [ "$FAIL_COUNT" -gt 0 ] && log "Re-run this script to retry failed uploads."
