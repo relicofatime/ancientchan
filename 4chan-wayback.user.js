@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.6.8
+// @version      0.6.9
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -18,6 +18,8 @@
 // @connect      archive.4plebs.org
 // @connect      archived.moe
 // @connect      desu-usergeneratedcontent.xyz
+// @connect      archive.org
+// @connect      us.archive.org
 // @connect      arch.b4k.dev
 // @connect      arch.b4k.co
 // @connect      arch-img.b4k.dev
@@ -1070,6 +1072,26 @@
       ...fullThumbs
     ].filter(Boolean));
   }
+  // ── archive.org re-hosted /mlp/ images (heinessen, 2012-05 → 2014-11) ────
+  // 635k full-size golden-era images re-hosted as one stored zip per month;
+  // archive.org serves individual members at:
+  //   https://archive.org/download/4chan-mlp-archive-YYYY-MM/YYYY-MM.zip/<file>
+  // 4chan filenames are unix timestamps, so the month bucket is derivable
+  // straight from the filename — no index download needed. Wrong guesses
+  // just 404 and the MD5 verification in firstVerifiedBlob rejects fakes.
+  const IA_MLP_FIRST = Date.UTC(2012, 4, 1) / 1000;   // coverage start, 2012-05-01
+  const IA_MLP_END = Date.UTC(2014, 11, 1) / 1000;    // coverage end (excl), 2014-12-01
+  function archiveOrgZipCandidates(board, file) {
+    if (board !== 'mlp') return [];
+    const m = String(file || '').match(/^(\d{10,13})\.[a-z0-9]+$/i);
+    if (!m) return [];
+    const ts = Number(m[1].slice(0, 10));
+    if (!(ts >= IA_MLP_FIRST && ts < IA_MLP_END)) return [];
+    const d = new Date(ts * 1000);
+    const ym = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}`;
+    return [`https://archive.org/download/4chan-mlp-archive-${ym}/${ym}.zip/${file}`];
+  }
+
   const MEDIA_URL_CAP = 24;
   function mediaUrlCandidates(m, kind) {
     if (!m) return [];
@@ -1079,6 +1101,7 @@
       for (const url of [m.full, m.mediaLink, m.remoteMediaLink]) addMediaUrlCandidates(fast, url);
       for (const file of mediaFullFiles(m)) {
         for (const u of mediaFilePathCandidates(board, 'image', file)) fast.push(u);
+        for (const u of archiveOrgZipCandidates(board, file)) fast.push(u);
         for (const u of originalFourcdnCandidates(board, file)) fast.push(u);
         for (const u of extraArchiveCandidates(board, 'image', file)) slow.push(u);
         for (const u of waybackCandidates(board, file)) slow.push(u);
