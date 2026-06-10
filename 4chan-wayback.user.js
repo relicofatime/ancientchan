@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.7.6
+// @version      0.7.7
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -649,6 +649,8 @@
     };
   } catch (e) { /* window unavailable */ }
   const MEDIA_CACHE_NAME = 'oldchan-media-v1';
+  const IA_MLP_INDEX_CACHE_NAME = 'oldchan-ia-mlp-index-v1';
+  const IA_MLP_INDEX_URL = 'https://archive.org/download/4chan-mlp-archive-index/md5-index.json';
   function mediaCacheAvailable() {
     return !!(CONFIG.mediaPersistentCache && 'caches' in window && window.caches);
   }
@@ -658,6 +660,71 @@
   let _mediaCacheHandle = null;
   function openMediaCache() {
     return _mediaCacheHandle || (_mediaCacheHandle = caches.open(MEDIA_CACHE_NAME));
+  }
+  let _iaMlpIndex = null;
+  let _iaMlpIndexPromise = null;
+  function archiveOrgIndexCacheAvailable() {
+    return !!('caches' in window && window.caches);
+  }
+  async function loadArchiveOrgMlpIndex() {
+    if (_iaMlpIndex) return _iaMlpIndex;
+    if (_iaMlpIndexPromise) return _iaMlpIndexPromise;
+    _iaMlpIndexPromise = (async () => {
+      mediaDebug('debug', 'archive.org md5 index load start', { url: IA_MLP_INDEX_URL });
+      let cache = null;
+      if (archiveOrgIndexCacheAvailable()) {
+        try {
+          cache = await caches.open(IA_MLP_INDEX_CACHE_NAME);
+          const cached = await cache.match(IA_MLP_INDEX_URL);
+          if (cached) {
+            const data = await cached.json();
+            if (data && typeof data === 'object') {
+              _iaMlpIndex = data;
+              mediaDebug('debug', 'archive.org md5 index cache hit', { url: IA_MLP_INDEX_URL });
+              return data;
+            }
+          }
+        } catch (e) {
+          mediaDebug('warn', 'archive.org md5 index cache read failed', { error: String(e && e.message || e) });
+        }
+      }
+      const controller = typeof AbortController === 'function' ? new AbortController() : null;
+      const timer = controller ? setTimeout(() => controller.abort(), 180000) : null;
+      let text = '';
+      try {
+        try {
+          const res = await fetch(IA_MLP_INDEX_URL, {
+            mode: 'cors',
+            credentials: 'omit',
+            signal: controller && controller.signal
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status || 0}`);
+          text = await res.text();
+        } catch (e) {
+          mediaDebug('warn', 'archive.org md5 index native fetch failed, trying GM', { error: String(e && e.message || e) });
+          text = await gmGet(IA_MLP_INDEX_URL, { timeout: 180000, json: false, maxWaitMs: 210000 });
+        }
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+      const data = JSON.parse(text);
+      if (!data || typeof data !== 'object') throw new Error('index JSON was not an object');
+      _iaMlpIndex = data;
+      if (cache) {
+        try {
+          await cache.put(IA_MLP_INDEX_URL, new Response(text, { headers: { 'Content-Type': 'application/json' } }));
+        } catch (e) {
+          mediaDebug('warn', 'archive.org md5 index cache write failed', { error: String(e && e.message || e) });
+        }
+      }
+      mediaDebug('debug', 'archive.org md5 index loaded', { url: IA_MLP_INDEX_URL, bytes: text.length });
+      return data;
+    })().catch((e) => {
+      _iaMlpIndexPromise = null;
+      mediaDebug('warn', 'archive.org md5 index load failed', { url: IA_MLP_INDEX_URL, error: String(e && e.message || e) });
+      return null;
+    });
+    return _iaMlpIndexPromise;
   }
   async function cachedMediaBlobURL(url) {
     if (!mediaCacheAvailable()) return null;
@@ -1422,12 +1489,61 @@
   // are stored as one zip per month. archive.org serves them at:
   //   https://archive.org/download/4chan-mlp-archive-YYYY-MM/<file>          (loose months)
   //   https://archive.org/download/4chan-mlp-archive-YYYY-MM/YYYY-MM.zip/<file>
-  // 4chan filenames are unix timestamps, so the month bucket is derivable
-  // straight from the filename — no index download needed. Wrong guesses
-  // just 404 and the MD5 verification in firstVerifiedBlob rejects fakes.
+  // The companion md5-index.json maps FoolFuuka media_hash values to exact
+  // archive paths. Use that for zip members; guessing missing zip members makes
+  // archive.org's view_archive.php return noisy server-side unzip 503s.
   const IA_MLP_FIRST = Date.UTC(2012, 4, 1) / 1000;   // coverage start, 2012-05-01
   const IA_MLP_END = Date.UTC(2014, 11, 1) / 1000;    // coverage end (excl), 2014-12-01
   const IA_MLP_DIRECT_MONTHS = new Set(['2012-06', '2012-07']);
+  function archiveOrgIndexHashKeys(hash) {
+    const h = String(hash || '').trim();
+    if (!h) return [];
+    const keys = [h];
+    const raw = h.replace(/-/g, '+').replace(/_/g, '/');
+    keys.push(raw);
+    keys.push(raw + '='.repeat((4 - raw.length % 4) % 4));
+    return uniq(keys.filter((k) => /^[A-Za-z0-9+/]{22}={0,2}$/.test(k)));
+  }
+  function archiveOrgIndexPathCandidates(path) {
+    const m = String(path || '').match(/^(\d{4}-\d{2})\/([^/?#]+)$/);
+    if (!m) return [];
+    const ym = m[1], file = m[2];
+    const directUrl = `https://archive.org/download/4chan-mlp-archive-${ym}/${file}`;
+    const zipUrl = `https://archive.org/download/4chan-mlp-archive-${ym}/${ym}.zip/${file}`;
+    return IA_MLP_DIRECT_MONTHS.has(ym) ? [directUrl, zipUrl] : [zipUrl];
+  }
+  async function archiveOrgIndexedMedia(board, media) {
+    if (board !== 'mlp' || !media || !media.length) return [];
+    const hashKeys = uniq(media.flatMap(mediaHashes).flatMap(archiveOrgIndexHashKeys));
+    if (!hashKeys.length) return [];
+    const index = await loadArchiveOrgMlpIndex();
+    if (!index) return [];
+    const seenPaths = new Set();
+    const out = [];
+    for (const hash of hashKeys) {
+      const path = index[hash];
+      if (!path || seenPaths.has(path)) continue;
+      const urls = archiveOrgIndexPathCandidates(path);
+      if (!urls.length) continue;
+      seenPaths.add(path);
+      const file = filenameFromUrl(path);
+      out.push({
+        full: urls[0],
+        fname: file,
+        board,
+        hash: normalizedHash(hash),
+        rawHash: hash,
+        sourceBase: 'archive.org-index',
+        archiveOrgUrls: urls,
+        archiveIndexPath: path
+      });
+      mediaDebug('debug', 'archive.org md5 index hit', { board, hash, path, urls });
+    }
+    if (!out.length) {
+      mediaDebug('debug', 'archive.org md5 index miss', { board, hashCount: hashKeys.length, hashes: hashKeys.slice(0, 6) });
+    }
+    return out;
+  }
   function archiveOrgDownloadCandidates(board, file) {
     if (board !== 'mlp') return [];
     const m = String(file || '').match(/^(\d{10,13})\.[a-z0-9]+$/i);
@@ -1447,12 +1563,19 @@
     }
     const d = new Date(ts * 1000);
     const ym = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}`;
-    const directUrl = `https://archive.org/download/4chan-mlp-archive-${ym}/${file}`;
-    const zipUrl = `https://archive.org/download/4chan-mlp-archive-${ym}/${ym}.zip/${file}`;
-    const urls = IA_MLP_DIRECT_MONTHS.has(ym) ? [directUrl, zipUrl] : [zipUrl];
+    const urls = IA_MLP_DIRECT_MONTHS.has(ym)
+      ? [`https://archive.org/download/4chan-mlp-archive-${ym}/${file}`]
+      : [];
+    if (!urls.length) {
+      mediaDebug('debug', 'archive.org candidate skipped', {
+        board, file, ts, ym,
+        reason: 'zip member guesses require md5 index hit'
+      });
+      return [];
+    }
     mediaDebug('debug', 'archive.org candidate added', {
       board, file, ts, ym,
-      layout: IA_MLP_DIRECT_MONTHS.has(ym) ? 'direct+zip' : 'zip',
+      layout: 'direct guess',
       urls
     });
     return urls;
@@ -1463,6 +1586,9 @@
     if (!m) return [];
     const board = mediaBoard(m);
     const archiveOrgFirst = [], fast = [], slow = [];
+    if (Array.isArray(m.archiveOrgUrls)) {
+      for (const u of m.archiveOrgUrls) archiveOrgFirst.push(u);
+    }
     if (kind === 'full') {
       for (const file of mediaFullFiles(m)) {
         for (const u of archiveOrgDownloadCandidates(board, file)) archiveOrgFirst.push(u);
@@ -1677,7 +1803,13 @@
     const apiP = postArchiveMedia(engine.board, p.num);
 
     if (kind === 'thumb') {
-      let r = await firstBlob(thumbUrls(local));
+      const indexedLocal = await archiveOrgIndexedMedia(engine.board, local);
+      let r = await firstFull(indexedLocal, expectedHash);
+      if (r) {
+        mediaDebug('debug', 'resolve selected thumb archive.org index local', { ...ctx, url: r.url });
+        return { ...r, thumbFallback: false };
+      }
+      r = await firstBlob(thumbUrls(local));
       if (r) {
         mediaDebug('debug', 'resolve selected thumb local', { ...ctx, url: r.url });
         return { ...r, thumbFallback: false };
@@ -1685,6 +1817,12 @@
       const api = await apiP;
       const apiHash = expectedHash || (api[0] && (api[0].rawHash || api[0].hash)) || '';
       mediaDebug(api.length ? 'debug' : 'warn', 'resolve thumb post API candidates', { ...ctx, count: api.length });
+      const indexedApi = await archiveOrgIndexedMedia(engine.board, [...local, ...api]);
+      r = await firstFull(indexedApi, apiHash);
+      if (r) {
+        mediaDebug('debug', 'resolve selected thumb archive.org index post API', { ...ctx, url: r.url });
+        return { ...r, thumbFallback: false };
+      }
       r = await firstBlob(thumbUrls(api));
       if (r) {
         mediaDebug('debug', 'resolve selected thumb post API', { ...ctx, url: r.url });
@@ -1692,6 +1830,12 @@
       }
       const searched = await searchArchiveMedia(engine.board, [...local, ...api]);
       mediaDebug(searched.length ? 'debug' : 'warn', 'resolve thumb search candidates', { ...ctx, count: searched.length });
+      const indexedSearched = await archiveOrgIndexedMedia(engine.board, [...local, ...api, ...searched]);
+      r = await firstFull(indexedSearched, apiHash || expectedHash);
+      if (r) {
+        mediaDebug('debug', 'resolve selected thumb archive.org index search', { ...ctx, url: r.url });
+        return { ...r, thumbFallback: false };
+      }
       r = await firstBlob(thumbUrls(searched));
       if (r) {
         mediaDebug('debug', 'resolve selected thumb search', { ...ctx, url: r.url });
@@ -1710,7 +1854,13 @@
     }
 
     const fullHash = expectedHash;
-    let r = await firstFull(local, fullHash);
+    const indexedLocal = await archiveOrgIndexedMedia(engine.board, local);
+    let r = await firstFull(indexedLocal, fullHash);
+    if (r) {
+      mediaDebug('debug', 'resolve selected full archive.org index local', { ...ctx, url: r.url });
+      return r;
+    }
+    r = await firstFull(local, fullHash);
     if (r) {
       mediaDebug('debug', 'resolve selected full local', { ...ctx, url: r.url });
       return r;
@@ -1718,6 +1868,12 @@
     const api = await apiP;
     const apiHash = fullHash || (api[0] && (api[0].rawHash || api[0].hash)) || '';
     mediaDebug(api.length ? 'debug' : 'warn', 'resolve full post API candidates', { ...ctx, count: api.length });
+    const indexedApi = await archiveOrgIndexedMedia(engine.board, [...local, ...api]);
+    r = await firstFull(indexedApi, apiHash);
+    if (r) {
+      mediaDebug('debug', 'resolve selected full archive.org index post API', { ...ctx, url: r.url });
+      return r;
+    }
     r = await firstFull(api, apiHash);
     if (r) {
       mediaDebug('debug', 'resolve selected full post API', { ...ctx, url: r.url });
@@ -1725,6 +1881,12 @@
     }
     const searched = await searchArchiveMedia(engine.board, [...local, ...api]);
     mediaDebug(searched.length ? 'debug' : 'warn', 'resolve full search candidates', { ...ctx, count: searched.length });
+    const indexedSearched = await archiveOrgIndexedMedia(engine.board, [...local, ...api, ...searched]);
+    r = await firstFull(indexedSearched, apiHash);
+    if (r) {
+      mediaDebug('debug', 'resolve selected full archive.org index search', { ...ctx, url: r.url });
+      return r;
+    }
     r = await firstFull(searched, apiHash);
     if (r) {
       mediaDebug('debug', 'resolve selected full search', { ...ctx, url: r.url });
@@ -1971,7 +2133,7 @@
     `actp:v1:${board}:${date}:${base.replace(/^https?:\/\//, '').replace(/[^a-z0-9]+/gi, '_')}:${page}`;
   const threadCacheKey = (board, num) => `thr:v5:${board}:${num}`;
   const threadSummaryCacheKey = (board, num) => `thrs:v1:${board}:${num}`;
-  const mediaResolveCacheKey = (board, num, kind) => `media:v6:${board}:${num}:${kind}`;
+  const mediaResolveCacheKey = (board, num, kind) => `media:v7:${board}:${num}:${kind}`;
   const localPostCacheKey = (board) => `localposts:v1:${board}`;
   const postIdentityCacheKey = () => 'postIdentity:v1';
 
@@ -4423,10 +4585,15 @@
       _postBlobResultCache.clear();
       _postMediaCache.clear();
       _searchMediaCache.clear();
-      if (mediaCacheAvailable()) {
+      _iaMlpIndex = null;
+      _iaMlpIndexPromise = null;
+      if (mediaCacheAvailable() || archiveOrgIndexCacheAvailable()) {
         _mediaCacheHandle = null; // stale after delete — reopen on next use
-        caches.delete(MEDIA_CACHE_NAME).then((ok) => {
-          try { console.info(`[oldchan media] cleared ${deleted} image resolution entries; persistent media cache deleted: ${ok}`); } catch (e) { /* console unavailable */ }
+        Promise.all([
+          mediaCacheAvailable() ? caches.delete(MEDIA_CACHE_NAME) : Promise.resolve(false),
+          archiveOrgIndexCacheAvailable() ? caches.delete(IA_MLP_INDEX_CACHE_NAME) : Promise.resolve(false)
+        ]).then(([mediaOk, indexOk]) => {
+          try { console.info(`[oldchan media] cleared ${deleted} image resolution entries; persistent media cache deleted: ${mediaOk}; archive.org md5 index cache deleted: ${indexOk}`); } catch (e) { /* console unavailable */ }
         });
       } else {
         try { console.info(`[oldchan media] cleared ${deleted} image resolution entries`); } catch (e) { /* console unavailable */ }
