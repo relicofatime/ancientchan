@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.7.1
+// @version      0.7.2
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -311,7 +311,9 @@
   // transient 503 on an immediate refresh) but they do get a short shared
   // pause so concurrent workers don't collectively hammer a struggling host.
   const _rateLimits = new Map(); // host → { until }
-  const RATE_LIMIT_MAX_RETRIES = 4;
+  // Retrying a host that just said "slow down" is the worst response when
+  // mirror archives exist — one retry, then throw so callers fail over.
+  const RATE_LIMIT_MAX_RETRIES = 1;
   const TRANSIENT_STATUS_MAX_RETRIES = 2;
   const GM_GET_MAX_WAIT_MS = 35000; // total budget incl. cooldowns — fail over to the next archive rather than sleep forever
 
@@ -319,7 +321,19 @@
   // gate caps simultaneous in-flight requests per host so the burst that
   // trips the limiter never happens. Slots are held through cooldown sleeps
   // on purpose — that's what makes the backoff collective.
-  const HOST_MAX_CONCURRENT = 4;
+  const HOST_MAX_CONCURRENT = 3;
+
+  // Per-host pacing: requests reserve evenly-spaced send slots (sync, so no
+  // race between concurrent reservers). Bursts are what trip archive
+  // limiters; ~4 req/s sustained reads like a fast human, not a scraper.
+  const HOST_MIN_SPACING_MS = 250;
+  const _hostNextSlot = new Map(); // host → earliest allowed send time
+  function reserveHostSlot(host) {
+    const now = Date.now();
+    const at = Math.max(now, _hostNextSlot.get(host) || 0);
+    _hostNextSlot.set(host, at + HOST_MIN_SPACING_MS);
+    return at - now; // ms this caller must wait before sending
+  }
   const _hostGates = new Map(); // host → { active, queue }
   function hostGateAcquire(host) {
     let g = _hostGates.get(host);
@@ -426,6 +440,8 @@
           await sleep(wait);
           continue; // cooldown may have been extended while we slept
         }
+        const spacing = reserveHostSlot(host);
+        if (spacing > 0) await sleep(spacing);
         const r = await new Promise((resolve, reject) => {
           GM_xmlhttpRequest({
             method: 'GET', url, timeout,
