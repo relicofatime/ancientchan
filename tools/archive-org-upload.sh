@@ -38,7 +38,7 @@ log "=== Step 0: Dependencies ==="
 export HOME="${HOME:-/root}"
 mkdir -p "$WORK"
 sudo apt-get update -qq
-sudo apt-get install -y -qq aria2 python3-pip jq
+sudo apt-get install -y -qq aria2 python3-pip jq zip
 pip3 install --quiet --break-system-packages internetarchive
 export PATH="$HOME/.local/bin:$PATH"
 
@@ -260,115 +260,67 @@ touch "$UPLOAD_LOG"
 BUCKET_TOTAL=$(find "$SORTED_DIR" -mindepth 1 -maxdepth 1 -type d | wc -l)
 BUCKET_NUM=0
 
-# ia rejects file arguments placed AFTER --metadata flags ("unrecognized
-# arguments"), and xargs always appends its args at the end of the command.
-# So we feed the file list (NUL-delimited, on stdin) through a wrapper that
-# puts the files BEFORE the metadata. Args: item_id, title, description.
-ia_upload_files() {
-  IA_ITEM="$1" IA_TITLE="$2" IA_DESC="$3" \
-  xargs -0 -r -n 2000 sh -c '
-    ia upload "$IA_ITEM" "$@" \
-      --metadata="collection:opensource" \
-      --metadata="mediatype:image" \
-      --metadata="title:$IA_TITLE" \
-      --metadata="description:$IA_DESC" \
-      --metadata="subject:4chan;mlp;archive;imageboard" \
-      --metadata="creator:anonymous" \
-      --retries=5 \
-      --no-derive
-  ' sh
-}
+# archive.org throttles per REQUEST, not per byte. Uploading 635k loose
+# files = 635k throttled requests (we measured hundreds of SlowDowns). So we
+# bundle each month into ONE stored (uncompressed) zip and upload that —
+# ~31 requests instead of 635k. archive.org indexes the zip and serves each
+# image individually at:
+#   https://archive.org/download/<item>/<YYYY-MM>.zip/<filename>
+# which is exactly what the userscript builds from the md5 index.
+ZIP_DIR="$WORK/zips"
+mkdir -p "$ZIP_DIR"
 
-upload_item() {
-  local item_id="$1"
-  local dir="$2"
-  local bucket_label="$3"
+process_bucket() {
+  local bucket_dir="$1" bucket_num="$2"
+  local bucket file_count item_id zipfile
+  bucket=$(basename "$bucket_dir")
+  file_count=$(find "$bucket_dir" -maxdepth 1 -type f | wc -l)
+  item_id="${COLLECTION}-${bucket}"
+  zipfile="$ZIP_DIR/${bucket}.zip"
+  log "[$bucket_num/$BUCKET_TOTAL] Bucket $bucket: $file_count files"
 
-  local fcount
-  fcount=$(find "$dir" -maxdepth 1 -type f | wc -l)
-
-  # Skip only if uploaded with the same file count — a bucket can gain files
-  # when a second source (heinessen, torrent) adds images to the same month.
-  if grep -q "^${item_id} OK ${fcount}$" "$UPLOAD_LOG" 2>/dev/null; then
-    log "  $item_id already uploaded ($fcount files), skipping."
+  # Skip if this exact month (by file count) already uploaded.
+  if grep -q "^${item_id} OK ${file_count}$" "$UPLOAD_LOG" 2>/dev/null; then
+    log "  $item_id already uploaded ($file_count files), skipping."
     return 0
   fi
-  log "  Uploading $item_id ($fcount files)..."
 
-  # Upload from inside the directory so remote paths are just filenames.
-  # Files (NUL-delimited) are piped in so they land before the metadata flags.
-  if (cd "$dir" && find . -maxdepth 1 -type f -printf '%f\0' | \
-      ia_upload_files "$item_id" \
-        "4chan /mlp/ archived images ($bucket_label)" \
-        "Archived full-size images from 4chan /mlp/, $bucket_label. Part of the $COLLECTION collection."); then
-    echo "$item_id OK $fcount" >> "$UPLOAD_LOG"
+  # Build a stored (-0, no compression) zip of just the filenames. -@ reads
+  # the file list on stdin to avoid ARG_MAX on 10k+ file months. Rebuild from
+  # scratch so a half-written zip from a previous crash can't corrupt it.
+  rm -f "$zipfile"
+  log "  Zipping $bucket ($file_count files, stored)..."
+  if ! (cd "$bucket_dir" && find . -maxdepth 1 -type f -printf '%P\n' | \
+        zip -0 -q "$zipfile" -@); then
+    log "  $item_id FAILED (zip) — will retry on next run."
+    echo "$item_id FAILED" >> "$UPLOAD_LOG"
+    rm -f "$zipfile"
+    return 1
+  fi
+
+  log "  Uploading $item_id ($(du -h "$zipfile" | cut -f1) zip)..."
+  if ia upload "$item_id" "$zipfile" \
+        --metadata="collection:opensource" \
+        --metadata="mediatype:image" \
+        --metadata="title:4chan /mlp/ archived images ($bucket)" \
+        --metadata="description:Archived full-size images from 4chan /mlp/, $bucket. Stored zip; archive.org serves each image at /download/$item_id/${bucket}.zip/<filename>. Part of the $COLLECTION collection." \
+        --metadata="subject:4chan;mlp;archive;imageboard" \
+        --metadata="creator:anonymous" \
+        --retries=8 --no-derive; then
+    echo "$item_id OK $file_count" >> "$UPLOAD_LOG"
     log "  $item_id done."
+    rm -f "$zipfile"   # reclaim disk as we go
     return 0
   else
     echo "$item_id FAILED" >> "$UPLOAD_LOG"
-    log "  $item_id FAILED — will retry on next run."
+    log "  $item_id FAILED (upload) — will retry on next run."
+    rm -f "$zipfile"
     return 1
   fi
 }
 
-process_bucket() {
-  local bucket_dir="$1" bucket_num="$2"
-  local bucket file_count
-  bucket=$(basename "$bucket_dir")
-  file_count=$(find "$bucket_dir" -maxdepth 1 -type f | wc -l)
-  log "[$bucket_num/$BUCKET_TOTAL] Bucket $bucket: $file_count files"
-
-  if [ "$file_count" -le "$MAX_PER_ITEM" ]; then
-    # Small enough for a single item
-    upload_item "${COLLECTION}-${bucket}" "$bucket_dir" "$bucket" || true
-  else
-    # Split into parts — archive.org works best with ≤10k files per item
-    local parts part_num part_id local_count filelist
-    parts=$(( (file_count + MAX_PER_ITEM - 1) / MAX_PER_ITEM ))
-    log "  Splitting into $parts parts ($MAX_PER_ITEM files each)..."
-
-    # Per-bucket split dir so parallel buckets don't clobber each other
-    local split_dir="$WORK/splits-$bucket"
-    rm -rf "$split_dir"
-    mkdir -p "$split_dir"
-
-    # Write file lists, one per part
-    find "$bucket_dir" -maxdepth 1 -type f -printf '%f\n' | sort | \
-      split -l "$MAX_PER_ITEM" -d --additional-suffix=".list" - "$split_dir/part-"
-
-    part_num=0
-    for filelist in "$split_dir"/part-*.list; do
-      [ -f "$filelist" ] || continue
-      part_num=$((part_num + 1))
-      part_id="${COLLECTION}-${bucket}-part${part_num}"
-
-      local_count=$(wc -l < "$filelist")
-      if grep -q "^${part_id} OK ${local_count}$" "$UPLOAD_LOG" 2>/dev/null; then
-        log "  $part_id already uploaded ($local_count files), skipping."
-        continue
-      fi
-      log "  Uploading $part_id ($local_count files)..."
-
-      # Files listed in the manifest (newline → NUL) piped in so they land
-      # before the metadata flags.
-      if (cd "$bucket_dir" && tr '\n' '\0' < "$filelist" | \
-          ia_upload_files "$part_id" \
-            "4chan /mlp/ archived images ($bucket, part $part_num)" \
-            "Archived full-size images from 4chan /mlp/, $bucket part $part_num of $parts. Part of the $COLLECTION collection."); then
-        echo "$part_id OK $local_count" >> "$UPLOAD_LOG"
-        log "  $part_id done."
-      else
-        echo "$part_id FAILED" >> "$UPLOAD_LOG"
-        log "  $part_id FAILED — will retry on next run."
-      fi
-    done
-
-    rm -rf "$split_dir"
-  fi
-}
-
-# Upload several items concurrently — archive.org handles parallel items
-# fine and single-stream uploads leave most of the bandwidth unused.
+# A few months in parallel. Each is now a single big object, so even 2-3
+# concurrent uploads stay well under archive.org's request-rate limit.
 for bucket_dir in "$SORTED_DIR"/*/; do
   [ -d "$bucket_dir" ] || continue
   BUCKET_NUM=$((BUCKET_NUM + 1))
