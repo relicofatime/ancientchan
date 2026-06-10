@@ -33,6 +33,9 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
 # ─── Step 0: Install dependencies ───────────────────────────────────
 log "=== Step 0: Dependencies ==="
+# systemd-run / cron start with no HOME; pip --user and the ia CLI both need
+# it. Default to root's home so the script works outside a login shell.
+export HOME="${HOME:-/root}"
 mkdir -p "$WORK"
 sudo apt-get update -qq
 sudo apt-get install -y -qq aria2 python3-pip jq
