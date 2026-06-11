@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.9.3
+// @version      0.10.0
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -36,6 +36,10 @@
 // @connect      images.4chan.org
 // @connect      s.4cdn.org
 // @connect      derpicdn.net
+// @connect      e621.net
+// @connect      static1.e621.net
+// @connect      danbooru.donmai.us
+// @connect      cdn.donmai.us
 // @connect      *
 // ==/UserScript==
 
@@ -613,11 +617,10 @@
     return board === 'mlp' && Number.isFinite(d) && d < MLP_ARCHIVE_ORG_FIRST_CUTOFF_MS;
   }
   function mediaCandidateBatchSize() {
-    return mlpArchiveOrgFirstRequired() ? 1 : MEDIA_BATCH_SIZE;
+    return MEDIA_BATCH_SIZE;
   }
   function mediaResolveConcurrencyLimit() {
-    const configured = Math.max(1, CONFIG.mediaResolveConcurrency || 1);
-    return mlpArchiveOrgFirstRequired() ? 1 : configured;
+    return Math.max(1, CONFIG.mediaResolveConcurrency || 1);
   }
   function mediaFetchTimeout(url) {
     return archiveOrgMedia(url) ? MEDIA_ARCHIVE_ORG_TIMEOUT_MS : MEDIA_TIMEOUT_MS;
@@ -664,9 +667,6 @@
   }
   function archiveOrgDirectFileUrl(url) {
     return /^https?:\/\/archive\.org\/download\/4chan-mlp-archive-(?:2012-05|2012-06)\/[^/]+$/i.test(url);
-  }
-  function archiveOrgMlpRehostUrl(url) {
-    return archiveOrgZipUrl(url) || archiveOrgDirectFileUrl(url);
   }
   function mediaSourceKind(url) {
     if (archiveOrgZipUrl(url)) return 'archive.org zip';
@@ -1326,18 +1326,16 @@
         return mediaFromApi(data && data.media, base, board);
       };
       const usable = (m) => m && (m.thumb || m.full || mediaHashes(m).length);
-      let found;
-      if (mlpArchiveOrgFirstRequired(board)) {
-        found = [];
-        for (const base of archiveAPIsFor(board)) {
-          const m = await readOne(base);
-          if (!usable(m)) continue;
-          found.push(m);
-          mediaDebug('debug', 'post API media sequential hit', { board, num, base, hash: firstMediaHash([m]) });
-          break;
-        }
-      } else {
-        found = await Promise.all(archiveAPIsFor(board).map(readOne));
+      // Sequential everywhere: the first archive with usable media answers
+      // for all of them — fanning out to every mirror tripled the request
+      // count for zero extra information.
+      const found = [];
+      for (const base of archiveAPIsFor(board)) {
+        const m = await readOne(base);
+        if (!usable(m)) continue;
+        found.push(m);
+        mediaDebug('debug', 'post API media sequential hit', { board, num, base, hash: firstMediaHash([m]) });
+        break;
       }
       const media = found.filter(usable);
       mediaDebug(media.length ? 'debug' : 'warn', 'post API media results', { board, num, count: media.length, media });
@@ -1581,13 +1579,22 @@
     if (_searchMediaCache.has(key)) return _searchMediaCache.get(key);
     const p = (async () => {
       const queries = [];
-      for (const h of hashes.slice(0, 6)) queries.push(['image', h]);
-      for (const n of names.slice(0, 8)) queries.push(['filename', n]);
-      const found = await Promise.all(archiveAPIsFor(board).flatMap((base) => queries.map(async ([field, value]) => {
-        const url = `${base}/_/api/chan/search/?board=${board}&${field}=${encodeURIComponent(value)}`;
+      for (const h of hashes.slice(0, 6)) queries.push(['image', h, false]);
+      for (const n of names.slice(0, 8)) queries.push(['filename', n, false]);
+      // Cross-board repost hunt (primary archive only, hash only): the same
+      // bytes often resurfaced on a sibling board — /mlp/ images turn up on
+      // /aco/, /trash/, /co/ — and a post-2014 repost is fully fetchable even
+      // when the original-era copy is long dead. Filenames are too generic
+      // to trust across boards; the hash match keeps this exact.
+      if (hashes.length) queries.push(['image', hashes[0], true]);
+      const found = await Promise.all(archiveAPIsFor(board).flatMap((base, baseIndex) => queries.map(async ([field, value, global]) => {
+        if (global && baseIndex > 0) return [];
+        const url = global
+          ? `${base}/_/api/chan/search/?${field}=${encodeURIComponent(value)}`
+          : `${base}/_/api/chan/search/?board=${board}&${field}=${encodeURIComponent(value)}`;
         let data;
         try { data = await gmJSON(url, 6000); }
-        catch (e) { mediaDebug('warn', 'search API failed', { board, base, field, value, url, error: String(e && e.message || e) }); return []; }
+        catch (e) { mediaDebug('warn', 'search API failed', { board, base, field, value, global, url, error: String(e && e.message || e) }); return []; }
         return matchingSearchMedia(data, base, seeds, board);
       })));
       const media = uniq(found.flat().filter((m) => m && (m.thumb || m.full)).map(JSON.stringify)).map(JSON.parse);
@@ -1607,7 +1614,6 @@
     return (m && m.board) || engine.board;
   }
   function mediaFullFiles(m) {
-    if (mlpArchiveOrgFirstRequired(mediaBoard(m)) && !firstMediaHash([m])) return [];
     return uniq([
       m && m.archiveMedia,
       m && filenameFromUrl(m.full),
@@ -1734,18 +1740,6 @@
       for (const file of mediaFullFiles(m)) {
         for (const u of archiveOrgDownloadCandidates(board, file)) archiveOrgFirst.push(u);
       }
-      if (mlpArchiveOrgFirstRequired(board)) {
-        const candidates = uniq(archiveOrgFirst.filter(archiveOrgMlpRehostUrl)).slice(0, MEDIA_URL_CAP);
-        mediaDebug(candidates.length ? 'debug' : 'warn', 'media URL candidates archive.org-only', {
-          board,
-          kind,
-          count: candidates.length,
-          archiveOrgOnly: true,
-          names: mediaNames(m),
-          candidates
-        });
-        return candidates;
-      }
       for (const url of [m.full, m.mediaLink, m.remoteMediaLink]) addMediaUrlCandidates(fast, url);
       for (const file of mediaFullFiles(m)) {
         for (const u of mediaFilePathCandidates(board, 'image', file)) fast.push(u);
@@ -1770,18 +1764,6 @@
 
     for (const file of mediaFullFiles(m)) {
       for (const u of archiveOrgDownloadCandidates(board, file)) archiveOrgFirst.push(u);
-    }
-    if (mlpArchiveOrgFirstRequired(board)) {
-      const candidates = uniq(archiveOrgFirst.filter(archiveOrgMlpRehostUrl)).slice(0, MEDIA_URL_CAP);
-      mediaDebug(candidates.length ? 'debug' : 'warn', 'media URL candidates archive.org-only', {
-        board,
-        kind,
-        count: candidates.length,
-        archiveOrgOnly: true,
-        names: mediaNames(m),
-        candidates
-      });
-      return candidates;
     }
     for (const url of [m.thumb, m.thumbLink]) addMediaUrlCandidates(fast, url);
     for (const url of [m.full, m.mediaLink, m.remoteMediaLink]) {
@@ -1882,9 +1864,7 @@
     const indexed = await archiveOrgIndexedMedia(board, media);
     let r = await firstFull(indexed, expectedHash);
     if (r) return r;
-    const urls = mlpArchiveOrgFirstRequired(board)
-      ? uniq(fullUrls(media).filter(archiveOrgMlpRehostUrl))
-      : mediaUrlsMatching(fullUrls(media), true);
+    const urls = mediaUrlsMatching(fullUrls(media), true);
     const found = expectedHash ? await firstVerifiedBlob(urls, expectedHash) : await firstBlob(urls);
     return found ? { ...found, thumbFallback: false } : null;
   }
@@ -1953,64 +1933,43 @@
   }
   // Last-resort: search booru sites by MD5 hash. Many 4chan images end up on
   // boorus with the original hash intact.
-  const BOORU_BOARDS = new Set(['a', 'c', 'cm', 'co', 'e', 'h', 'w', 'wg', 'wsr', 'ic', 'y', 'd', 'gif']);
-  async function booruMd5Search(hash) {
+  const BOORU_BOARDS = new Set(['a', 'aco', 'c', 'cm', 'co', 'd', 'e', 'gif', 'h', 'ic', 'mlp', 'trash', 'u', 'w', 'wg', 'wsr', 'y']);
+  // Exact-MD5 lookups on booru sites: the same bytes the post had, recovered
+  // from wherever else they were uploaded. Order is board-aware — pony
+  // content lives on e621, anime boards on the danbooru family.
+  function booruMd5Endpoints(board) {
+    const e621 = { name: 'e621', url: (hex) => `https://e621.net/posts.json?tags=md5%3A${hex}`,
+      parse: (d) => d && d.posts && d.posts[0] && d.posts[0].file && d.posts[0].file.url };
+    const danbooru = { name: 'danbooru', url: (hex) => `https://danbooru.donmai.us/posts.json?tags=md5%3A${hex}&limit=1`,
+      parse: (d) => Array.isArray(d) && d[0] && (d[0].file_url || d[0].large_file_url) };
+    const yandere = { name: 'yande.re', url: (hex) => `https://yande.re/post.json?tags=md5:${hex}&limit=1`,
+      parse: (d) => Array.isArray(d) && d[0] && d[0].file_url };
+    const konachan = { name: 'konachan', url: (hex) => `https://konachan.com/post.json?tags=md5:${hex}&limit=1`,
+      parse: (d) => Array.isArray(d) && d[0] && d[0].file_url };
+    const safebooru = { name: 'safebooru', url: (hex) => `https://safebooru.org/index.php?page=dapi&s=post&q=index&json=1&tags=md5:${hex}&limit=1`,
+      parse: (d) => {
+        const p = (Array.isArray(d) ? d : (d && d.post) || [])[0];
+        if (!p) return null;
+        return p.image ? `https://safebooru.org/images/${p.directory || ''}/${p.image}` : null;
+      } };
+    if (board === 'mlp') return [e621, danbooru, safebooru];
+    if (board === 'aco' || board === 'trash' || board === 'gif' || board === 'd') return [e621, danbooru, yandere, konachan, safebooru];
+    return [danbooru, yandere, konachan, safebooru, e621];
+  }
+  async function booruMd5Search(hash, board = engine.board) {
     const hex = md5Base64ToHex(hash);
     if (!hex || hex.length !== 32) return null;
-    const endpoints = [
-      { url: `https://yande.re/post.json?tags=md5:${hex}&limit=1`, parse: (d) => d[0] && d[0].file_url },
-      { url: `https://konachan.com/post.json?tags=md5:${hex}&limit=1`, parse: (d) => d[0] && d[0].file_url },
-      { url: `https://safebooru.org/index.php?page=dapi&s=post&q=index&json=1&tags=md5:${hex}&limit=1`, parse: (d) => {
-        const p = (d.post || d)[0]; if (!p) return null;
-        const dir = p.directory || ''; const img = p.image || '';
-        return img ? `https://safebooru.org/images/${dir}/${img}` : null;
-      }},
-    ];
-    for (const ep of endpoints) {
+    for (const ep of booruMd5Endpoints(board)) {
       try {
-        const data = await gmJSON(ep.url, 6000);
-        const fileUrl = ep.parse(Array.isArray(data) ? data : (data && data.post ? data : []));
+        const data = await gmJSON(ep.url(hex), 8000);
+        const fileUrl = ep.parse(data);
         if (fileUrl) {
+          mediaDebug('debug', 'booru md5 hit', { booru: ep.name, hex, fileUrl });
           const blob = await gmBlobURL(fileUrl);
           if (blob) return { blob, url: fileUrl, thumbFallback: false };
         }
       } catch (e) { /* booru unavailable, skip */ }
     }
-    return null;
-  }
-  async function resolveMlpArchiveOrgFirstMedia(p, kind, ctx, local, expectedHash, apiP) {
-    const api = await apiP;
-    const apiHash = expectedHash || firstMediaHash(api);
-    const primarySeeds = [...local, ...api];
-    const primaryHash = apiHash || expectedHash;
-    mediaDebug(api.length ? 'debug' : 'warn', `resolve ${kind} post API candidates`, { ...ctx, count: api.length, archiveOrgFirst: true });
-
-    let r = await firstArchiveOrgFull(engine.board, primarySeeds, primaryHash);
-    if (r) {
-      mediaDebug('debug', `resolve selected ${kind} archive.org first`, { ...ctx, url: r.url });
-      return { ...r, thumbFallback: false };
-    }
-
-    const searched = primaryHash ? [] : await searchArchiveMedia(engine.board, primarySeeds);
-    if (!primaryHash || searched.length) {
-      mediaDebug(searched.length ? 'debug' : 'warn', `resolve ${kind} search candidates`, { ...ctx, count: searched.length, archiveOrgFirst: true });
-    }
-    const searchedSeeds = [...primarySeeds, ...searched];
-    if (searched.length) {
-      r = await firstArchiveOrgFull(engine.board, searchedSeeds, primaryHash);
-      if (r) {
-        mediaDebug('debug', `resolve selected ${kind} archive.org first search`, { ...ctx, url: r.url });
-        return { ...r, thumbFallback: false };
-      }
-    }
-
-    mediaDebug('warn', 'resolve miss, archive.org-only mode', {
-      ...ctx,
-      hash: primaryHash,
-      localCount: local.length,
-      apiCount: api.length,
-      searchCount: searched.length
-    });
     return null;
   }
   async function resolvePostMediaBlob(p, kind) {
@@ -2024,9 +1983,6 @@
       local: local.map((m) => ({ full: m && m.full, thumb: m && m.thumb, fname: m && m.fname, hash: m && m.hash }))
     });
     const apiP = postArchiveMedia(engine.board, p.num);
-    if (mlpArchiveOrgFirstRequired(engine.board)) {
-      return resolveMlpArchiveOrgFirstMedia(p, kind, ctx, local, expectedHash, apiP);
-    }
 
     if (kind === 'thumb') {
       const indexedLocal = await archiveOrgIndexedMedia(engine.board, local);
@@ -2120,17 +2076,19 @@
     }
 
     const all = [...local, ...api, ...searched];
-    r = await firstThumb(all);
-    if (r) {
-      mediaDebug('warn', 'resolve selected thumb fallback for full', { ...ctx, url: r.url });
-      return r;
-    }
+    // Booru MD5 recovery comes BEFORE the thumb fallback: the exact original
+    // bytes from another site beat a 125px thumbnail every time.
     if (BOORU_BOARDS.has(engine.board) && (apiHash || expectedHash)) {
       r = await booruMd5Search(apiHash || expectedHash);
       if (r) {
         mediaDebug('debug', 'resolve selected booru md5 match', { ...ctx, url: r.url });
         return r;
       }
+    }
+    r = await firstThumb(all);
+    if (r) {
+      mediaDebug('warn', 'resolve selected thumb fallback for full', { ...ctx, url: r.url });
+      return r;
     }
     mediaDebug('warn', 'resolve miss', ctx);
     return null;
@@ -2373,7 +2331,9 @@
     `actp:v1:${board}:${date}:${base.replace(/^https?:\/\//, '').replace(/[^a-z0-9]+/gi, '_')}:${page}`;
   const threadCacheKey = (board, num) => `thr:v5:${board}:${num}`;
   const threadSummaryCacheKey = (board, num) => `thrs:v1:${board}:${num}`;
-  const mediaResolveCacheKey = (board, num, kind) => `media:v11:${board}:${num}:${kind}`;
+  // v12: archive.org-only mode removed — v11 entries hold misses recorded
+  // while every non-archive.org source was deliberately disabled.
+  const mediaResolveCacheKey = (board, num, kind) => `media:v12:${board}:${num}:${kind}`;
   const localPostCacheKey = (board) => `localposts:v1:${board}`;
   const postIdentityCacheKey = () => 'postIdentity:v1';
 
