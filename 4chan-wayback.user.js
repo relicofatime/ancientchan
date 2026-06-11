@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.10.9
+// @version      0.10.10
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -205,7 +205,6 @@
     catalogPageDelayMs: 150,
     catalogSearchMaxPages: 20,
     bumpLimit: 300,
-    indexPages: 10,
     indexThreadsPerPage: 18,
     mediaResolveConcurrency: 3,
     mediaMissCacheMs: 24 * 60 * 60 * 1000,
@@ -298,6 +297,16 @@
   // ahead of desu for text — but it keeps only thumbnails for /mlp/, so a
   // sequential first-answer-wins media query must not stop there.
   const BOARD_MEDIA_API_PREFERENCE = { mlp: [DESU, MOE, B4K] };
+  // Real board thread capacity. Most boards hold 10 pages / ~150 threads;
+  // /mlp/ uniquely holds 450 (the deep board is what kept generals alive).
+  const BOARD_THREAD_CAPACITY = { mlp: 450 };
+  const DEFAULT_THREAD_CAPACITY = 150;
+  function boardThreadCapacity(board = engine.board) {
+    return BOARD_THREAD_CAPACITY[board] || DEFAULT_THREAD_CAPACITY;
+  }
+  function boardIndexPages(board = engine.board) {
+    return Math.max(1, Math.ceil(boardThreadCapacity(board) / (CONFIG.indexThreadsPerPage || 18)));
+  }
   function mediaAPIsFor(board) {
     const hosts = archivesForBoard(board);
     const preferred = BOARD_MEDIA_API_PREFERENCE[board];
@@ -2446,7 +2455,7 @@
   // v10: v9 catalogs were enumerated with 6-page day sampling and wrongly
   // marked complete — they're missing mid-day-active threads.
   const catalogCacheKey = (board, date) =>
-    `catalog:v10:${board}:${date}:active${CONFIG.catalogActivityThreadTarget}:d${CONFIG.catalogActivityMaxDays}`;
+    `catalog:v10:${board}:${date}:active${Math.max(boardThreadCapacity(board), CONFIG.catalogActivityThreadTarget || 0)}:d${CONFIG.catalogActivityMaxDays}`;
   function cachedCatalogOps(board, date) {
     const cached = cacheGet(catalogCacheKey(board, date));
     const ops = Array.isArray(cached) ? cached : (cached && Array.isArray(cached.ops) ? cached.ops : null);
@@ -3773,7 +3782,7 @@
     return CATALOG_SORTS.includes(sort) ? sort : 'bump';
   }
   function catalogActiveCapacity() {
-    return Math.max(CONFIG.indexPages * CONFIG.indexThreadsPerPage,
+    return Math.max(boardThreadCapacity(),
       CONFIG.catalogActivityThreadTarget || 0);
   }
   function compareCatalogStates(a, b, sort = 'bump') {
@@ -3949,7 +3958,7 @@
   }
   function clampIndexPage(page) {
     const n = Number(page) || 1;
-    return Math.max(1, Math.min(CONFIG.indexPages, Math.floor(n)));
+    return Math.max(1, Math.min(boardIndexPages(), Math.floor(n)));
   }
   function indexPath(page = engine.indexPage) {
     const p = clampIndexPage(page);
@@ -4914,8 +4923,9 @@
     const btn = (label, page, enabled) => el('button', enabled
       ? { class: 'wb-pagebtn', onclick: (e) => { e.preventDefault(); goIndex(page); } }
       : { class: 'wb-pagebtn', disabled: 'disabled' }, label);
+    const pages = boardIndexPages();
     nodes.push(btn('Previous', engine.indexPage - 1, engine.indexPage > 1), ' ');
-    for (let i = 1; i <= CONFIG.indexPages; i++) {
+    for (let i = 1; i <= pages; i++) {
       if (i === engine.indexPage) {
         nodes.push(el('span', { class: 'wb-pagecur' }, `[${i}]`));
       } else {
@@ -4925,9 +4935,9 @@
           onclick: (e) => { e.preventDefault(); goIndex(i); }
         }, `[${i}]`));
       }
-      if (i < CONFIG.indexPages) nodes.push(' ');
+      if (i < pages) nodes.push(' ');
     }
-    nodes.push(' ', btn('Next', engine.indexPage + 1, engine.indexPage < CONFIG.indexPages));
+    nodes.push(' ', btn('Next', engine.indexPage + 1, engine.indexPage < pages));
     return nodes;
   }
   function navBar(position = 'top') {
