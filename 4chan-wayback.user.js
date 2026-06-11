@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.10.5
+// @version      0.10.6
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -1373,6 +1373,29 @@
     _postMediaCache.set(key, p);
     return p;
   }
+  // Last-resort metadata sweep: every archive's post API in parallel. Only
+  // runs when everything the sequential lookup produced turned out dead —
+  // each archive deduplicates previews independently, so a mirror can know
+  // a working path the first archive doesn't.
+  const _postMediaAllCache = new Map();
+  async function postArchiveMediaAll(board, num) {
+    const key = `${board}:${num}:all`;
+    if (_postMediaAllCache.has(key)) return _postMediaAllCache.get(key);
+    const p = (async () => {
+      const found = await Promise.all(mediaAPIsFor(board).map(async (base) => {
+        const url = `${base}/_/api/chan/post/?board=${board}&num=${num}`;
+        try {
+          const data = await gmJSON(url, 8000);
+          return mediaFromApi(data && data.media, base, board);
+        } catch (e) { return null; }
+      }));
+      const media = found.filter((m) => m && (m.thumb || m.full || mediaHashes(m).length));
+      mediaDebug(media.length ? 'debug' : 'warn', 'post API all-archives sweep', { board, num, count: media.length });
+      return media;
+    })();
+    _postMediaAllCache.set(key, p);
+    return p;
+  }
 
   function normalizedHash(h) {
     return h ? String(h).replace(/=+$/, '').replace(/\//g, '_').replace(/\+/g, '-') : '';
@@ -2051,6 +2074,16 @@
         mediaDebug('debug', 'resolve selected thumb search', { ...ctx, url: r.url });
         return { ...r, thumbFallback: false };
       }
+      // Everything from the first archive is dead — sweep every archive's
+      // post API for independently-deduplicated paths before giving up.
+      const apiAll = await postArchiveMediaAll(engine.board, p.num);
+      if (apiAll.length) {
+        r = await firstBlob(thumbUrls(apiAll));
+        if (r) {
+          mediaDebug('debug', 'resolve selected thumb all-archives sweep', { ...ctx, url: r.url });
+          return { ...r, thumbFallback: false };
+        }
+      }
       const fullHash = apiHash || expectedHash;
       r = fullHash
         ? await firstVerifiedBlob(fullUrls([...local, ...api, ...searched]), fullHash)
@@ -2103,7 +2136,24 @@
       return r;
     }
 
-    const all = [...local, ...api, ...searched];
+    // Everything from the first archive is dead — sweep every archive's
+    // post API for independently-deduplicated paths before falling back.
+    const apiAll = await postArchiveMediaAll(engine.board, p.num);
+    if (apiAll.length) {
+      const indexedAll = await archiveOrgIndexedMedia(engine.board, [...local, ...api, ...apiAll]);
+      r = await firstFull(indexedAll, apiHash || firstMediaHash(apiAll));
+      if (r) {
+        mediaDebug('debug', 'resolve selected full archive.org index all-archives', { ...ctx, url: r.url });
+        return r;
+      }
+      r = await firstFull(apiAll, apiHash || firstMediaHash(apiAll));
+      if (r) {
+        mediaDebug('debug', 'resolve selected full all-archives sweep', { ...ctx, url: r.url });
+        return r;
+      }
+    }
+
+    const all = [...local, ...api, ...searched, ...apiAll];
     // Booru MD5 recovery comes BEFORE the thumb fallback: the exact original
     // bytes from another site beat a 125px thumbnail every time.
     if (BOORU_BOARDS.has(engine.board) && (apiHash || expectedHash)) {
