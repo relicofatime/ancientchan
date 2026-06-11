@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.9.0
+// @version      0.9.1
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -2737,6 +2737,8 @@
     const maxDays = Math.max(1, CONFIG.catalogActivityMaxDays || 365);
     let visibleAtTarget = 0;
     let visibleAtEnd = 0;
+    let scanDay = null;   // day the backward activity scan is currently on
+    let scanOffset = 0;
     const mergeOp = (op) => {
       if (!op || !op.num || seen.has(String(op.num))) return false;
       seen.add(String(op.num));
@@ -2753,7 +2755,10 @@
     };
     const emit = (reason = 'catalog') => {
       const ops = recount();
-      if (opts.onProgress) opts.onProgress(ops, { board, date, reason, visibleAtTarget, visibleAtEnd, target });
+      if (opts.onProgress) opts.onProgress(ops, {
+        board, date, reason, visibleAtTarget, visibleAtEnd, target,
+        scanDay, scanOffset, maxDays
+      });
       return ops;
     };
 
@@ -2831,6 +2836,9 @@
     for (let offset = 0; offset < maxDays && (visibleAtTarget < target || visibleAtEnd < target); offset++) {
       scannedDays = offset + 1;
       const day = addDays(date, -offset);
+      scanDay = day;
+      scanOffset = offset;
+      emit('scanning day'); // advance the loading note even on quiet days
       if (offset > 0) {
         // The day's OP search is cached forever and shared with direct
         // visits to that date — registering it here saves a thread fetch
@@ -3717,7 +3725,9 @@
       note = el('div', { id: 'wb-catalog-sync', class: 'wb-note' });
       list.prepend(note);
     }
-    note.textContent = `Syncing catalog ${engine.catalogHydrateDone}/${engine.catalogHydrateTotal}...`;
+    const left = Math.max(0, engine.catalogHydrateTotal - engine.catalogHydrateDone);
+    note.textContent = `Syncing threads ${engine.catalogHydrateDone}/${engine.catalogHydrateTotal}` +
+      ` (${left} left) — reply counts fill in as each thread arrives...`;
   }
   function updateCatalogSyncNoteOnly() {
     if (engine.openThread) return;
@@ -3899,8 +3909,8 @@
     } else if (empty) {
       empty.remove();
     }
-    const loading = $('#wb-loading', grid);
-    if (loading && states.length) loading.remove();
+    // The loading note is owned by loadBoardOps — it shows live scan
+    // progress while threads render and is removed when enumeration ends.
 
     for (const state of states) {
       let card = engine.catalogCards.get(state.num);
@@ -3983,8 +3993,8 @@
     } else if (empty) {
       empty.remove();
     }
-    const loading = $('#wb-loading', list);
-    if (loading && (states.length || engine.ops.length)) loading.remove();
+    // The loading note is owned by loadBoardOps — it shows live scan
+    // progress while threads render and is removed when enumeration ends.
 
     const sig = `${page}:full:${states.map((o) => o.num).join(',')}`;
     if (sig !== engine._lastIndexSig) {
@@ -4806,7 +4816,8 @@
 
     renderShell();
     const idx = $('#wb-index') || $('#wb-catalog');
-    if (idx) idx.append(el('div', { id: 'wb-loading', class: 'wb-note' }, `Loading /${engine.board}/ ...`));
+    if (idx) idx.append(el('div', { id: 'wb-loading', class: 'wb-note' },
+      `Loading /${engine.board}/ for ${CONFIG.date} — finding the day's threads…`));
     ensureAnchor();
     startTimer();
 
@@ -4825,15 +4836,36 @@
   // outages pass, so the index must never die on its loading note. Stops
   // only when the user navigates (token change) or opens a thread.
   async function loadBoardOps(token, attempt = 0) {
+    // Live progress in the loading note: how many threads are in, how full
+    // the board is, and which day the backward scan is on — so a slow cold
+    // load reads as work happening instead of a dead page.
+    const onProgress = (partialOps, meta = {}) => {
+      if (token !== engine.catalogToken || engine.openThread) return;
+      engine.ops = partialOps;
+      refreshCurrentBoardSnapshot();
+      const note = $('#wb-loading');
+      if (!note) return;
+      const bits = [`Loading /${engine.board}/ for ${CONFIG.date}`];
+      bits.push(`${partialOps.length} thread${partialOps.length === 1 ? '' : 's'} found`);
+      if (typeof meta.visibleAtEnd === 'number' && meta.target) {
+        bits.push(`${Math.min(meta.visibleAtEnd, meta.target)}/${meta.target} board slots filled`);
+      }
+      if (meta.scanDay && meta.scanOffset > 0) {
+        bits.push(`scanning ${meta.scanDay} for older active threads (day ${meta.scanOffset + 1} of up to ${meta.maxDays})`);
+      }
+      note.textContent = bits.join(' — ') + '…';
+    };
     let ops = null;
     try {
-      ops = await enumerateCatalogCandidates(engine.board, CONFIG.date, { atClock: engine.clock });
+      ops = await enumerateCatalogCandidates(engine.board, CONFIG.date, { atClock: engine.clock, onProgress });
     } catch (e) {
       cacheDebug('warn', 'board enumeration failed', { board: engine.board, date: CONFIG.date, attempt, error: String(e && e.message || e) });
     }
     if (token !== engine.catalogToken) return;
 
     if (ops && ops.length) {
+      const note = $('#wb-loading');
+      if (note) note.remove(); // enumeration done — the sync note takes over
       engine.ops = ops;
       loadCachedThreadSummariesIntoMemory(engine.board, engine.ops);
       loadCachedThreadsIntoMemory(engine.board, engine.ops);
