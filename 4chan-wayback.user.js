@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.8.3
+// @version      0.9.0
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -139,18 +139,18 @@
     startTime: new Date().toTimeString().slice(0, 5),   // default to current local time
     speed: 1,             // time multiplier (1 = true real time)
     prefetch: true,       // background-cache threads as their OPs appear
-    prefetchDelayMs: 250,
-    prefetchConcurrency: 2,
-    catalogActivityMaxDays: 365,
-    catalogActivityThreadTarget: 300,
-    catalogActivitySearchMaxPages: 60,
-    catalogHydrateConcurrency: 2,
-    catalogHydrateLimit: 400,
-    catalogHydrateYieldMs: 40,
+    prefetchDelayMs: 500,
+    prefetchConcurrency: 1,
+    catalogActivityMaxDays: 14,
+    catalogActivityThreadTarget: 150,
+    catalogActivitySearchMaxPages: 6,
+    catalogHydrateConcurrency: 1,
+    catalogHydrateLimit: 150,
+    catalogHydrateYieldMs: 200,
     catalogSyncUpdateEvery: 10,
     catalogTinyOpsThreshold: 12,
     catalogPageDelayMs: 150,
-    catalogSearchMaxPages: 60,
+    catalogSearchMaxPages: 20,
     bumpLimit: 300,
     indexPages: 10,
     indexThreadsPerPage: 18,
@@ -199,10 +199,23 @@
     mlp: [B4K, MOE, DESU]
   };
 
+  // Archives that adopted a board late hold none of its older history —
+  // querying them for replay dates before they started wastes the opening
+  // request of every single fetch on a guaranteed 404.
+  const ARCHIVE_BOARD_SINCE = {
+    [B4K]: { mlp: Date.UTC(2021, 0, 1) }
+  };
+  function archiveCoversReplayDate(base, board) {
+    const since = ARCHIVE_BOARD_SINCE[base] && ARCHIVE_BOARD_SINCE[base][board];
+    if (!since) return true;
+    const d = replayDateMs();
+    return !Number.isFinite(d) || d >= since;
+  }
   // Every archive that hosts this board, best first. Falls back to archived.moe
   // for an unrecognised board rather than fanning out to everything blindly.
   function archivesForBoard(board) {
-    const hosts = ARCHIVE_COVERAGE.filter((a) => a.boards.includes(board)).map((a) => a.base);
+    const hosts = ARCHIVE_COVERAGE.filter((a) => a.boards.includes(board)).map((a) => a.base)
+      .filter((base) => archiveCoversReplayDate(base, board));
     if (!hosts.length) return [MOE];
     const preferred = BOARD_ARCHIVE_PREFERENCE[board] || [];
     if (!preferred.length) return hosts;
@@ -224,7 +237,15 @@
   }
   const archiveFor = (board) => archivesForBoard(board)[0];
   const archiveAPIsFor = (board) => archivesForBoard(board);
-  const threadAPIsFor = (board) => archivesForBoard(board);
+  // Thread fetches shard across archives by thread number: hydrating a
+  // catalog is dozens of fetches, and splitting them halves the load each
+  // host sees. Failover order is preserved — just the starting host rotates.
+  const threadAPIsFor = (board, num) => {
+    const hosts = archivesForBoard(board);
+    if (hosts.length < 2 || num == null) return hosts;
+    const i = (Number(String(num).slice(-4)) || 0) % hosts.length;
+    return [...hosts.slice(i), ...hosts.slice(0, i)];
+  };
 
   const BOARD_NAMES = {
     3: '3DCG',
@@ -333,25 +354,88 @@
   // Per-host concurrency gate. Board loads fan out dozens of API calls; the
   // gate caps simultaneous in-flight requests per host so the burst that
   // trips the limiter never happens. Slots are held through cooldown sleeps
-  // on purpose — that's what makes the backoff collective.
-  const HOST_MAX_CONCURRENT = 3;
+  // on purpose — that's what makes the backoff collective. archive.org
+  // serves bulk downloads and tolerates more parallelism than the FoolFuuka
+  // archives, whose limiters watch API traffic closely.
+  function hostMaxConcurrent(host) {
+    return /(^|\.)archive\.org$/i.test(host) ? 4 : 2;
+  }
 
   // Per-host pacing: requests reserve evenly-spaced send slots (sync, so no
   // race between concurrent reservers). Bursts are what trip archive
-  // limiters; ~4 req/s sustained reads like a fast human, not a scraper.
-  const HOST_MIN_SPACING_MS = 250;
+  // limiters — but every host's budget is different and undocumented, so
+  // spacing is LEARNED: widen sharply when a host pushes back (429), ease
+  // slowly after sustained success, and persist the result across sessions
+  // so a new visit doesn't have to re-trip the limiter to rediscover it.
+  const HOST_SPACING_DEFAULTS = [
+    [/(^|\.)desuarchive\.org$/i, 900],   // known strict
+    [/(^|\.)archived\.moe$/i, 600],
+    [/(^|\.)archive\.org$/i, 150]        // bulk host, no fussy limiter
+  ];
+  const HOST_SPACING_FALLBACK = 300;
+  const HOST_SPACING_MIN = 250;
+  const HOST_SPACING_MAX = 5000;
+  const HOST_SPACING_TIGHTEN_EVERY = 25; // consecutive OKs before easing
+  function hostSpacingDefault(host) {
+    for (const [re, ms] of HOST_SPACING_DEFAULTS) if (re.test(host)) return ms;
+    return HOST_SPACING_FALLBACK;
+  }
+  let _hostPacing = null; // host → { ms, okStreak }, lazy-loaded from GM storage
+  function hostPacing(host) {
+    if (!_hostPacing) {
+      _hostPacing = new Map();
+      try {
+        const saved = JSON.parse(GM_getValue('hostPacing:v1', 'null')) || {};
+        for (const h of Object.keys(saved)) {
+          const ms = Number(saved[h]);
+          if (ms > 0) _hostPacing.set(h, { ms: Math.min(HOST_SPACING_MAX, ms), okStreak: 0 });
+        }
+      } catch (e) { /* fresh start */ }
+    }
+    let p = _hostPacing.get(host);
+    if (!p) { p = { ms: hostSpacingDefault(host), okStreak: 0 }; _hostPacing.set(host, p); }
+    return p;
+  }
+  let _hostPacingSaveTimer = 0;
+  function persistHostPacing() {
+    if (_hostPacingSaveTimer) return;
+    _hostPacingSaveTimer = setTimeout(() => {
+      _hostPacingSaveTimer = 0;
+      const out = {};
+      for (const [h, p] of _hostPacing || []) {
+        if (Math.round(p.ms) !== hostSpacingDefault(h)) out[h] = Math.round(p.ms);
+      }
+      try { GM_setValue('hostPacing:v1', JSON.stringify(out)); } catch (e) { /* storage unavailable */ }
+    }, 2000);
+  }
+  function widenHostSpacing(host) {
+    const p = hostPacing(host);
+    p.ms = Math.min(HOST_SPACING_MAX, Math.max(p.ms * 1.8, hostSpacingDefault(host)));
+    p.okStreak = 0;
+    persistHostPacing();
+  }
+  function noteHostSuccess(host) {
+    const p = hostPacing(host);
+    if (++p.okStreak < HOST_SPACING_TIGHTEN_EVERY) return;
+    p.okStreak = 0;
+    // Ease toward (but never much below) the host's default — defaults
+    // already encode "known strict"; learning may relax them somewhat.
+    const floor = Math.max(HOST_SPACING_MIN, hostSpacingDefault(host) * 0.6);
+    const next = Math.max(floor, p.ms * 0.93);
+    if (Math.round(next) !== Math.round(p.ms)) { p.ms = next; persistHostPacing(); }
+  }
   const _hostNextSlot = new Map(); // host → earliest allowed send time
   function reserveHostSlot(host) {
     const now = Date.now();
     const at = Math.max(now, _hostNextSlot.get(host) || 0);
-    _hostNextSlot.set(host, at + HOST_MIN_SPACING_MS);
+    _hostNextSlot.set(host, at + hostPacing(host).ms);
     return at - now; // ms this caller must wait before sending
   }
   const _hostGates = new Map(); // host → { active, queue }
   function hostGateAcquire(host) {
     let g = _hostGates.get(host);
     if (!g) { g = { active: 0, queue: [] }; _hostGates.set(host, g); }
-    if (g.active < HOST_MAX_CONCURRENT) { g.active++; return Promise.resolve(); }
+    if (g.active < hostMaxConcurrent(host)) { g.active++; return Promise.resolve(); }
     return new Promise((res) => g.queue.push(res));
   }
   function hostGateRelease(host) {
@@ -481,6 +565,7 @@
             headers: mediaHeaderSummary(r.responseHeaders || ''),
             url
           });
+          widenHostSpacing(host);
           if (rlAttempts >= RATE_LIMIT_MAX_RETRIES) throw statusError(r, url);
           noteRateLimit(url, r.responseHeaders, rlAttempts);
           rlAttempts++;
@@ -496,6 +581,7 @@
           continue;
         }
         if (!okStatus(r.status)) throw statusError(r, url);
+        noteHostSuccess(host);
         if (!json) return r.responseText;
         try { return JSON.parse(r.responseText); }
         catch (e) { throw new Error('Bad JSON from ' + url); }
@@ -2620,6 +2706,10 @@
       searched = true;
       fullyEnumerated = true;
       mergeOps(result.ops);
+      // One archive's complete answer is the day's OP list — the mirrors
+      // carry the same data, so asking them too just doubles the traffic
+      // that gets us rate limited. They remain failover for errors above.
+      break;
     }
 
     const ops = sortedUniqueOps(all);
@@ -2674,8 +2764,41 @@
       if (cached && cached.complete && !tinyCatalogOps(cachedOps) && !opts.expand) return ops;
     }
 
+    // OPs gathered from per-day OP searches (cheap, paginated HTML that
+    // caches forever) so activity threads don't each cost a full thread
+    // fetch just to read their OP. Thread fetches remain the fallback for
+    // threads created before the scan window (long-lived generals).
+    const opByNum = new Map();
+    const registerDayOps = (ops) => {
+      for (const op of ops || []) if (op && op.num) opByNum.set(String(op.num), op);
+    };
+    // A provisional summary from search-page data: correct bump order and a
+    // same-day lower bound on replies, painted immediately. Hydration
+    // replaces it with exact counts when the thread itself arrives.
+    const seedProvisionalSummary = (threadNum, op, bumpTs, dayPostCount) => {
+      const key = String(threadNum);
+      if (engine.threadSummaries.has(key)) return;
+      const cached = cachedThreadSummary(board, key);
+      if (cached) { rememberThreadSummary(key, cached); return; }
+      rememberThreadSummary(key, {
+        num: key,
+        opTs: op.ts,
+        bump: Math.max(op.ts, bumpTs || 0),
+        sticky: !!op.sticky,
+        deleted: false,
+        expiredTs: 0,
+        lastTs: Math.max(op.ts, bumpTs || 0),
+        replyCount: Math.max(0, dayPostCount || 0),
+        imageCount: postHasMedia(op) ? 1 : 0,
+        omittedImages: 0,
+        provisional: true,
+        cachedAt: Date.now()
+      });
+    };
+
     try {
       const dayOps = await enumerateDay(board, date, { includeLocal: false });
+      registerDayOps(dayOps);
       let added = false;
       for (const op of dayOps || []) if (mergeOp(op)) added = true;
       if (added) emit('selected day ops');
@@ -2683,9 +2806,16 @@
       cacheDebug('warn', 'selected day OP scan failed', { board, date, error: String(e && e.message || e) });
     }
 
-    const addThreadCandidate = async (threadNum) => {
+    const addThreadCandidate = async (threadNum, bumpTs, dayPostCount) => {
       if (!threadNum || seenThreads.has(String(threadNum))) return false;
       seenThreads.add(String(threadNum));
+      const known = opByNum.get(String(threadNum));
+      if (known) {
+        if (known.ts > endClock || !mergeOp(known)) return false;
+        seedProvisionalSummary(threadNum, known, bumpTs, dayPostCount);
+        emit('activity thread');
+        return true;
+      }
       let result;
       try { result = await fetchThread(board, threadNum, { preferCache: true }); }
       catch (e) { return false; }
@@ -2701,6 +2831,13 @@
     for (let offset = 0; offset < maxDays && (visibleAtTarget < target || visibleAtEnd < target); offset++) {
       scannedDays = offset + 1;
       const day = addDays(date, -offset);
+      if (offset > 0) {
+        // The day's OP search is cached forever and shared with direct
+        // visits to that date — registering it here saves a thread fetch
+        // per activity thread created that day.
+        try { registerDayOps(await enumerateDay(board, day, { includeLocal: false })); }
+        catch (e) { /* registry is an optimization; the scan continues */ }
+      }
       for (const base of searchArchivesForBoard(board)) {
         const activity = await enumerateArchiveActivityDay(board, day, base, {
           force: opts.force || tinyCatalogOps(cachedOps)
@@ -2714,11 +2851,22 @@
           cacheDebug('warn', 'archive activity search failed', { board, day, base, error: activity.error });
           continue;
         }
+        const bumpByThread = new Map();
+        const countByThread = new Map();
+        for (const p of activity.posts || []) {
+          if (!p || !p.threadNum || p.ts > endClock) continue;
+          const k = String(p.threadNum);
+          bumpByThread.set(k, Math.max(bumpByThread.get(k) || 0, p.ts));
+          countByThread.set(k, (countByThread.get(k) || 0) + 1);
+        }
         for (const threadNum of activity.threads) {
-          await addThreadCandidate(threadNum);
+          await addThreadCandidate(threadNum, bumpByThread.get(String(threadNum)), countByThread.get(String(threadNum)));
           if (visibleAtTarget >= target && visibleAtEnd >= target) break;
         }
-        if (visibleAtTarget >= target && visibleAtEnd >= target) break;
+        // One archive's answer covers the day — mirrors hold the same data
+        // and asking them too is how we got rate limited. They stay as
+        // failover when this one errors.
+        break;
       }
     }
     sortedUniqueOps(all);
@@ -2743,7 +2891,7 @@
     // result we eventually return may be a worse copy than what exists — mark
     // it degraded so the persistent cache retries it instead of pinning it.
     let sawFetchFailure = false;
-    for (const base of threadAPIsFor(board)) {
+    for (const base of threadAPIsFor(board, num)) {
       const url = `${base}/_/api/chan/thread/?board=${board}&num=${num}`;
       let data;
       try { data = await gmJSON(url, 12000); }
@@ -2927,7 +3075,8 @@
     const token = engine.catalogToken;
     const limit = Math.max(1, CONFIG.catalogHydrateLimit || ops.length || 1);
     const queue = catalogHydrationQueue(ops)
-      .filter((op) => op && op.num && !engine.threads.has(String(op.num)))
+      .filter((op) => op && op.num && !engine.threads.has(String(op.num)) &&
+        !engine.threadPermanentMiss.has(String(op.num)))
       .slice(0, limit);
     if (!queue.length) {
       engine.catalogHydrating = false;
@@ -2946,7 +3095,14 @@
     const worker = async () => {
       while (token === engine.catalogToken && next < queue.length) {
         const op = queue[next++];
-        try { await fetchThread(board, op.num, { preferCache: true }); }
+        try {
+          const r = await fetchThread(board, op.num, { preferCache: true });
+          // A definitive archive answer ("not found") is permanent — the
+          // thread was never archived. Transient failures stay retryable.
+          if (r && r.error && !/fetch failed|rate limit|timeout/i.test(String(r.error))) {
+            engine.threadPermanentMiss.add(String(op.num));
+          }
+        }
         catch (e) { /* keep hydrating the rest */ }
         finally {
           engine.catalogHydrateDone++;
@@ -2965,6 +3121,17 @@
       engine.catalogHydrating = false;
       updateCatalogSyncNoteOnly();
       scheduleBoardUpdate();
+      // Threads that failed (or fell past the per-pass cap) get another pass
+      // later — hydration keeps trying until everything reachable is in.
+      const missing = ops.filter((op) => op && op.num &&
+        !engine.threads.has(String(op.num)) &&
+        !engine.threadPermanentMiss.has(String(op.num))).length;
+      if (missing) {
+        const wait = 45000 + Math.floor(Math.random() * 15000);
+        setTimeout(() => {
+          if (token === engine.catalogToken && !engine.catalogHydrating) hydrateCatalog(board, ops);
+        }, wait);
+      }
     }
   }
 
@@ -3047,6 +3214,7 @@
     replyTimes: new Map(),  // num -> sorted [post ts...] for bump ordering
     threads: new Map(),     // num -> full posts[] (drives bump order + reply previews)
     threadSummaries: new Map(), // num -> compact persisted catalog state for stable reloads
+    threadPermanentMiss: new Set(), // nums the archives definitively don't have — stop re-asking
     catalogHydrating: false,
     catalogHydrateDone: 0,
     catalogHydrateTotal: 0,
@@ -3193,6 +3361,14 @@
         } else if (insertQuote(p.num)) { e.preventDefault(); }
       }
     }, 'No.' + p.num));
+    // 4chan's real sticky/closed icons, hotlinked from the same static host
+    // the site itself used — not lookalikes.
+    if (isOp && p.sticky) head.append(' ', el('img', {
+      class: 'wb-threadicon', src: 'https://s.4cdn.org/image/sticky.gif', alt: 'Sticky', title: 'Sticky'
+    }));
+    if (isOp && p.locked) head.append(' ', el('img', {
+      class: 'wb-threadicon', src: 'https://s.4cdn.org/image/closed.gif', alt: 'Closed', title: 'Closed'
+    }));
     head.append(el('span', { class: 'wb-backlinks' }));
 
     const body = el('blockquote', { class: 'wb-comment',
@@ -3387,6 +3563,7 @@
     engine.replyTimes = new Map();
     engine.threads = new Map();
     engine.threadSummaries = new Map();
+    engine.threadPermanentMiss = new Set();
     engine.catalogHydrating = false;
     engine.catalogHydrateDone = 0;
     engine.catalogHydrateTotal = 0;
@@ -3865,7 +4042,32 @@
     renderShell();
     const loading = $('#wb-thread-posts');
     if (loading) loading.append(el('div', { class: 'wb-note' }, 'Loading…'));
-    const t = await fetchThread(engine.board, num, { preferCache: true });
+    // Keep trying until the thread arrives. Rate limits lift and outages
+    // pass — a thread view must never die on its loading note waiting for a
+    // manual Update click. Only navigating away stops the loop.
+    let t = null;
+    for (let attempt = 0; ; attempt++) {
+      if (String(engine.openThread) !== String(num)) return; // navigated away
+      try {
+        t = await fetchThread(engine.board, num, { preferCache: true });
+        // "fetch failed" is the all-archives-unreachable verdict — transient,
+        // so retry. Real archive answers ("not found") render below.
+        if (t && t.error && /fetch failed|rate limit|timeout/i.test(String(t.error))) {
+          throw new Error(String(t.error));
+        }
+        break;
+      } catch (e) {
+        const wait = Math.min(45000, 4000 * Math.pow(1.6, attempt)) + Math.floor(Math.random() * 2000);
+        const host = $('#wb-thread-posts');
+        if (host) {
+          host.innerHTML = '';
+          host.append(el('div', { class: 'wb-note' },
+            `Archives aren't answering (${String(e && e.message || e).slice(0, 100)}). Retrying in ${Math.round(wait / 1000)}s…`));
+        }
+        await sleep(wait);
+      }
+    }
+    if (String(engine.openThread) !== String(num)) return;
     engine.thread = t;
     const host = $('#wb-thread-posts');
     if (host) host.innerHTML = '';
@@ -4494,6 +4696,12 @@
   // of every page. Top/Bottom scroll our overlay (the scroll container).
   function indexPageLinks() {
     const nodes = [];
+    // Era-correct Previous/Next form buttons flanking the page list, as the
+    // bottom of every real 4chan index page had.
+    const btn = (label, page, enabled) => el('button', enabled
+      ? { class: 'wb-pagebtn', onclick: (e) => { e.preventDefault(); goIndex(page); } }
+      : { class: 'wb-pagebtn', disabled: 'disabled' }, label);
+    nodes.push(btn('Previous', engine.indexPage - 1, engine.indexPage > 1), ' ');
     for (let i = 1; i <= CONFIG.indexPages; i++) {
       if (i === engine.indexPage) {
         nodes.push(el('span', { class: 'wb-pagecur' }, `[${i}]`));
@@ -4506,6 +4714,7 @@
       }
       if (i < CONFIG.indexPages) nodes.push(' ');
     }
+    nodes.push(' ', btn('Next', engine.indexPage + 1, engine.indexPage < CONFIG.indexPages));
     return nodes;
   }
   function navBar(position = 'top') {
@@ -4609,23 +4818,42 @@
       refreshCurrentBoardSnapshot();
     }
 
-    const ops = await enumerateCatalogCandidates(engine.board, CONFIG.date, { atClock: engine.clock });
-    if (token !== engine.catalogToken) return;
-    engine.ops = ops;
+    await loadBoardOps(token);
+  }
 
-    if (!engine.ops.length) {
-      renderShell();
-      const host = $('#wb-index') || $('#wb-catalog');
-      if (host) host.append(el('div', { class: 'wb-note' },
-        `No archived threads for /${engine.board}/ on ${CONFIG.date}. ` +
-        `Try /g/, /a/, /tg/, /mu/, or /co/ and a date from 2013–2015.`));
+  // Enumerate the board and keep retrying on failure — rate limits lift and
+  // outages pass, so the index must never die on its loading note. Stops
+  // only when the user navigates (token change) or opens a thread.
+  async function loadBoardOps(token, attempt = 0) {
+    let ops = null;
+    try {
+      ops = await enumerateCatalogCandidates(engine.board, CONFIG.date, { atClock: engine.clock });
+    } catch (e) {
+      cacheDebug('warn', 'board enumeration failed', { board: engine.board, date: CONFIG.date, attempt, error: String(e && e.message || e) });
+    }
+    if (token !== engine.catalogToken) return;
+
+    if (ops && ops.length) {
+      engine.ops = ops;
+      loadCachedThreadSummariesIntoMemory(engine.board, engine.ops);
+      loadCachedThreadsIntoMemory(engine.board, engine.ops);
+      refreshCurrentBoardSnapshot();
+      hydrateCatalog(engine.board, engine.ops);
       return;
     }
 
-    loadCachedThreadSummariesIntoMemory(engine.board, engine.ops);
-    loadCachedThreadsIntoMemory(engine.board, engine.ops);
-    refreshCurrentBoardSnapshot();
-    hydrateCatalog(engine.board, engine.ops);
+    const wait = Math.min(120000, 10000 * Math.pow(1.6, attempt)) + Math.floor(Math.random() * 5000);
+    const host = $('#wb-index') || $('#wb-catalog');
+    if (host) {
+      let note = $('#wb-loading', host);
+      if (!note) { note = el('div', { id: 'wb-loading', class: 'wb-note' }); host.append(note); }
+      note.textContent = `No threads loaded for /${engine.board}/ on ${CONFIG.date} yet — ` +
+        `the archives may be rate limiting or the board may have nothing archived that day. ` +
+        `Retrying in ${Math.round(wait / 1000)}s…`;
+    }
+    setTimeout(() => {
+      if (token === engine.catalogToken && !engine.openThread) loadBoardOps(token, attempt + 1);
+    }, wait);
   }
 
   function init() {
@@ -4989,6 +5217,8 @@
     .wb-spoiler:hover, .wb-spoiler:hover * { color:#fff !important; }
     .wb-quotelink { color:var(--wb-quotelink); text-decoration:underline; }
     .wb-omitted { display:block; color:var(--wb-dim); margin:2px 0 2px 20px; }
+    .wb-threadicon { vertical-align:text-bottom; margin:0 1px; }
+    .wb-pagebtn { font-size:11px; }
     .wb-previews { }
     .wb-previewrow { margin:0; }
     .wb-file { display:block; }
