@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.10.10
+// @version      0.10.11
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -205,7 +205,7 @@
     catalogPageDelayMs: 150,
     catalogSearchMaxPages: 20,
     bumpLimit: 300,
-    indexThreadsPerPage: 18,
+    indexThreadsPerPage: 15, // era-correct: 4chan index pages held 15 threads
     mediaResolveConcurrency: 3,
     mediaMissCacheMs: 24 * 60 * 60 * 1000,
     mediaPersistentCache: true,
@@ -297,9 +297,10 @@
   // ahead of desu for text — but it keeps only thumbnails for /mlp/, so a
   // sequential first-answer-wins media query must not stop there.
   const BOARD_MEDIA_API_PREFERENCE = { mlp: [DESU, MOE, B4K] };
-  // Real board thread capacity. Most boards hold 10 pages / ~150 threads;
-  // /mlp/ uniquely holds 450 (the deep board is what kept generals alive).
-  const BOARD_THREAD_CAPACITY = { mlp: 450 };
+  // Real board thread capacity: 10 index pages x 15 threads = 150. Kept as
+  // a per-board table in case a board with a genuinely different depth turns
+  // up; entries here override the default.
+  const BOARD_THREAD_CAPACITY = {};
   const DEFAULT_THREAD_CAPACITY = 150;
   function boardThreadCapacity(board = engine.board) {
     return BOARD_THREAD_CAPACITY[board] || DEFAULT_THREAD_CAPACITY;
