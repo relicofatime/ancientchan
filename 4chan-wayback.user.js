@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.10.4
+// @version      0.10.5
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -255,6 +255,20 @@
   }
   const archiveFor = (board) => archivesForBoard(board)[0];
   const archiveAPIsFor = (board) => archivesForBoard(board);
+  // Media METADATA lookups ask the board's media authority first. For /mlp/
+  // that's desuarchive: it serves full images and its thumb_link carries the
+  // deduplicated preview path (reposts reuse the first upload's thumbnail
+  // file, under a different timestamp than the post's own). archived.moe is
+  // ahead of desu for text — but it keeps only thumbnails for /mlp/, so a
+  // sequential first-answer-wins media query must not stop there.
+  const BOARD_MEDIA_API_PREFERENCE = { mlp: [DESU, MOE, B4K] };
+  function mediaAPIsFor(board) {
+    const hosts = archivesForBoard(board);
+    const preferred = BOARD_MEDIA_API_PREFERENCE[board];
+    if (!preferred) return hosts;
+    const front = preferred.filter((b) => hosts.includes(b));
+    return [...front, ...hosts.filter((b) => !front.includes(b))];
+  }
   // Thread fetches shard across archives by thread number: hydrating a
   // catalog is dozens of fetches, and splitting them halves the load each
   // host sees. Failover order is preserved — just the starting host rotates.
@@ -1344,7 +1358,7 @@
       // for all of them — fanning out to every mirror tripled the request
       // count for zero extra information.
       const found = [];
-      for (const base of archiveAPIsFor(board)) {
+      for (const base of mediaAPIsFor(board)) {
         const m = await readOne(base);
         if (!usable(m)) continue;
         found.push(m);
@@ -1601,7 +1615,7 @@
       // when the original-era copy is long dead. Filenames are too generic
       // to trust across boards; the hash match keeps this exact.
       if (hashes.length) queries.push(['image', hashes[0], true]);
-      const found = await Promise.all(archiveAPIsFor(board).flatMap((base, baseIndex) => queries.map(async ([field, value, global]) => {
+      const found = await Promise.all(mediaAPIsFor(board).flatMap((base, baseIndex) => queries.map(async ([field, value, global]) => {
         if (global && baseIndex > 0) return [];
         const url = global
           ? `${base}/_/api/chan/search/?${field}=${encodeURIComponent(value)}`
@@ -2358,7 +2372,7 @@
   const threadSummaryCacheKey = (board, num) => `thrs:v1:${board}:${num}`;
   // v12: archive.org-only mode removed — v11 entries hold misses recorded
   // while every non-archive.org source was deliberately disabled.
-  const mediaResolveCacheKey = (board, num, kind) => `media:v12:${board}:${num}:${kind}`;
+  const mediaResolveCacheKey = (board, num, kind) => `media:v13:${board}:${num}:${kind}`;
   const localPostCacheKey = (board) => `localposts:v1:${board}`;
   const postIdentityCacheKey = () => 'postIdentity:v1';
 
@@ -4987,7 +5001,7 @@
     try {
       for (const k of cacheKeys()) {
         if (k.startsWith('thr:')) cacheDelete(k); // legacy GM thread cache, now in Cache Storage
-        else if (k.startsWith('media:') && !k.startsWith('media:v12:')) cacheDelete(k); // stale resolve versions
+        else if (k.startsWith('media:') && !k.startsWith('media:v13:')) cacheDelete(k); // stale resolve versions
       }
     } catch (e) { /* best-effort cleanup */ }
     try { pruneStorage(null); } catch (e) { /* fallback prune */ }
