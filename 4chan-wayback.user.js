@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.10.8
+// @version      0.10.9
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -192,7 +192,11 @@
     prefetchConcurrency: 1,
     catalogActivityMaxDays: 14,
     catalogActivityThreadTarget: 150,
-    catalogActivitySearchMaxPages: 6,
+    // Pages are 25 posts each, newest first — 20 pages samples the last ~500
+    // posts of a day. 6 was too shallow: on a 4k-post/day board it only saw
+    // the final hour, so threads whose last bump was mid-day never got
+    // enumerated at all. Pages cache forever, so the depth is a one-time cost.
+    catalogActivitySearchMaxPages: 20,
     catalogHydrateConcurrency: 1,
     catalogHydrateLimit: 150,
     catalogHydrateYieldMs: 200,
@@ -2439,8 +2443,10 @@
     }
   }
   const indexCacheKey = (board, date) => `idx:v8:${board}:${date}`;
+  // v10: v9 catalogs were enumerated with 6-page day sampling and wrongly
+  // marked complete — they're missing mid-day-active threads.
   const catalogCacheKey = (board, date) =>
-    `catalog:v9:${board}:${date}:active${CONFIG.catalogActivityThreadTarget}:d${CONFIG.catalogActivityMaxDays}`;
+    `catalog:v10:${board}:${date}:active${CONFIG.catalogActivityThreadTarget}:d${CONFIG.catalogActivityMaxDays}`;
   function cachedCatalogOps(board, date) {
     const cached = cacheGet(catalogCacheKey(board, date));
     const ops = Array.isArray(cached) ? cached : (cached && Array.isArray(cached.ops) ? cached.ops : null);
@@ -5092,6 +5098,7 @@
       for (const k of cacheKeys()) {
         if (k.startsWith('thr:')) cacheDelete(k); // legacy GM thread cache, now in Cache Storage
         else if (k.startsWith('media:') && !k.startsWith('media:v13:')) cacheDelete(k); // stale resolve versions
+        else if (k.startsWith('catalog:') && !k.startsWith('catalog:v10:')) cacheDelete(k); // shallow-sampled catalogs
       }
     } catch (e) { /* best-effort cleanup */ }
     try { pruneStorage(null); } catch (e) { /* fallback prune */ }
