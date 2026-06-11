@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.10.0
+// @version      0.10.1
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -2260,6 +2260,17 @@
       _storageScanDone = false;
     }
   }
+  // Eviction order when the budget fills: bulky re-derivable page caches go
+  // first; media resolve results go LAST — each ~100-byte entry replaces an
+  // entire multi-request image re-search, so sweeping them out (the old
+  // oldest-first policy) made every refresh re-hunt images it had found.
+  function pruneClassRank(k) {
+    if (k.startsWith('idxp:') || k.startsWith('actp:')) return 0; // paged search HTML results
+    if (k.startsWith('idx:') || k.startsWith('catalog:')) return 1; // day/catalog enumerations
+    if (k.startsWith('thrs:')) return 2; // thread summaries (rebuilt from thread cache)
+    if (k.startsWith('media:')) return 4; // resolve results — most expensive to recreate
+    return 3;
+  }
   function pruneStorage(exceptKey, targetBytes = CACHE_MAX_BYTES) {
     const keys = cacheKeys().filter((k) => !CACHE_PROTECTED_KEYS.has(k) && k !== exceptKey);
     if (!keys.length) return 0;
@@ -2282,7 +2293,7 @@
         } catch (e) { canRead = false; }
       }
       return { key: k, cachedAt, size };
-    }).sort((a, b) => a.cachedAt - b.cachedAt);
+    }).sort((a, b) => pruneClassRank(a.key) - pruneClassRank(b.key) || a.cachedAt - b.cachedAt);
     if (!canRead) {
       let deleted = 0;
       for (const item of scored) { if (cacheDelete(item.key)) deleted++; }
@@ -4881,7 +4892,10 @@
     ensureStyles(); // in case the document-start injection ran before <head> existed
     try { initStorageEstimate(); } catch (e) { /* storage may be unreadable */ }
     try {
-      for (const k of cacheKeys()) { if (k.startsWith('thr:')) cacheDelete(k); }
+      for (const k of cacheKeys()) {
+        if (k.startsWith('thr:')) cacheDelete(k); // legacy GM thread cache, now in Cache Storage
+        else if (k.startsWith('media:') && !k.startsWith('media:v12:')) cacheDelete(k); // stale resolve versions
+      }
     } catch (e) { /* best-effort cleanup */ }
     try { pruneStorage(null); } catch (e) { /* fallback prune */ }
 
