@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.10.2
+// @version      0.10.3
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -164,6 +164,7 @@
     mediaPersistentMaxBytes: 8 * 1024 * 1024,
     threadPersistentCache: true,
     localPostMaxImageBytes: 1024 * 1024,
+    markArchiveOrgMedia: false, // ★ badge on images served from the archive.org rehost
     mediaDebug: false,
     cacheDebug: false
   };
@@ -3441,6 +3442,15 @@
         img.title = '';
         img.hidden = false;
         img.src = r.blob;
+        // ★ badge for images served from the archive.org /mlp/ rehost —
+        // visible only while the control-bar toggle is on.
+        const fromIA = !!(r.url && (archiveOrgZipUrl(r.url) || archiveOrgDirectFileUrl(r.url)));
+        const star = fileInfo.querySelector('.wb-ia-star');
+        if (fromIA && !star) {
+          fileInfo.append(el('span', { class: 'wb-ia-star', title: 'recovered from the archive.org rehost' }, ' ★'));
+        } else if (!fromIA && star) {
+          star.remove();
+        }
         if (r.url && (linkKind === 'full' || fileLink.getAttribute('href') === 'javascript:void(0)')) {
           fileLink.href = r.url;
         }
@@ -4430,6 +4440,7 @@
       board: engine.board, date: CONFIG.date, startTime: CONFIG.startTime,
       speed: engine.speed, barHidden: engine.barHidden, autoUpdate: engine.autoUpdate,
       colors: activeColors, design: activeDesign, catalogSort: engine.catalogSort,
+      markArchiveOrgMedia: !!CONFIG.markArchiveOrgMedia,
       mediaDebug: !!CONFIG.mediaDebug, cacheDebug: !!CONFIG.cacheDebug
     });
   }
@@ -4495,6 +4506,17 @@
     }
 
     const hide = el('button', { onclick: () => setBarHidden(true) }, 'Hide');
+    const iaStars = el('button', {
+      id: 'wb-iastars',
+      title: 'Mark images served from the archive.org /mlp/ rehost with a ★',
+      onclick: () => {
+        CONFIG.markArchiveOrgMedia = !CONFIG.markArchiveOrgMedia;
+        saveSettings();
+        applyIaStarMode();
+        iaStars.classList.toggle('wb-on', CONFIG.markArchiveOrgMedia);
+      },
+      class: CONFIG.markArchiveOrgMedia ? 'wb-on' : ''
+    }, '★');
     bar.append(
       el('label', {}, 'board /', boardInp, '/'),
       el('label', {}, ' date ', dateInp),
@@ -4504,11 +4526,19 @@
       el('label', {}, ' colors ', colorSel),
       el('label', {}, ' design ', designSel),
       el('label', {}, ' catalog ', catalogSortSel),
-      pause, hide,
+      pause, hide, iaStars,
       el('span', { id: 'wb-ratelimit' }, ''),
       el('span', { id: 'wb-clock' }, '')
     );
     return bar;
+  }
+
+  // Root-level class so the stars toggle without re-rendering anything; the
+  // <html> element survives every renderShell rebuild.
+  function applyIaStarMode() {
+    try {
+      document.documentElement.classList.toggle('wb-ia-stars', !!CONFIG.markArchiveOrgMedia);
+    } catch (e) { /* document unavailable */ }
   }
 
   // Switch to another board's replay — keeps the running clock epoch (same date).
@@ -4954,12 +4984,14 @@
       engine.speed = saved.speed || engine.speed;
       engine.barHidden = !!saved.barHidden;
       if (typeof saved.autoUpdate === 'boolean') engine.autoUpdate = saved.autoUpdate;
+      if (typeof saved.markArchiveOrgMedia === 'boolean') CONFIG.markArchiveOrgMedia = saved.markArchiveOrgMedia;
       if (typeof saved.mediaDebug === 'boolean') CONFIG.mediaDebug = saved.mediaDebug;
       if (typeof saved.cacheDebug === 'boolean') CONFIG.cacheDebug = saved.cacheDebug;
       engine.catalogSort = normCatalogSort(saved.catalogSort);
       applyTheme(saved.theme || saved.colors);
       applyDesign(saved.design);
     }
+    applyIaStarMode();
 
     // Reflect the persisted clock epoch in the speed/pause controls before the
     // first render, so the bar matches the clock we're about to resume.
@@ -5298,6 +5330,9 @@
     .wb-threadicon { vertical-align:text-bottom; margin:0 1px; }
     .wb-pagebtn { font-size:11px; }
     .wb-fullmissing { color:var(--wb-dim); font-style:italic; font-size:11px; }
+    .wb-ia-star { display:none; color:#fc0; text-shadow:0 0 1px #a80; cursor:default; }
+    html.wb-ia-stars .wb-ia-star { display:inline; }
+    #wb-iastars.wb-on { color:#fc0; }
     .wb-previews { }
     .wb-previewrow { margin:0; }
     .wb-file { display:block; }
