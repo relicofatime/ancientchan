@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.10.3
+// @version      0.10.4
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -113,6 +113,18 @@
     if (!root) return;
     for (const v of VALID_DESIGNS) root.classList.toggle('wb-design-' + v, activeDesign === v);
   }
+  // Font rendering: '2005' = bitcrushed GDI look (binary alpha threshold),
+  // '2012' = modern smooth antialiasing for people who find the crunch
+  // illegible. Independent of the design dropdown.
+  const VALID_FONTS = ['2005', '2012'];
+  let activeFont = '2005';
+  const normFont = (f) => VALID_FONTS.includes(f) ? f : '2005';
+  function applyFont(f) {
+    activeFont = normFont(f);
+    const root = document.documentElement;
+    if (!root) return;
+    for (const v of VALID_FONTS) root.classList.toggle('wb-font-' + v, activeFont === v);
+  }
   function ensureStyles() {
     if (_stylesInjected) return;
     const css = getCSS();
@@ -134,6 +146,7 @@
       try { saved = JSON.parse(GM_getValue('settings', 'null')); } catch (e) { /* none yet */ }
       applyTheme(saved && saved.theme || saved && saved.colors);
       applyDesign(saved && saved.design);
+      applyFont(saved && saved.font);
     }
   }
   ensureStyles();
@@ -4439,7 +4452,7 @@
     cacheSet('settings', {
       board: engine.board, date: CONFIG.date, startTime: CONFIG.startTime,
       speed: engine.speed, barHidden: engine.barHidden, autoUpdate: engine.autoUpdate,
-      colors: activeColors, design: activeDesign, catalogSort: engine.catalogSort,
+      colors: activeColors, design: activeDesign, font: activeFont, catalogSort: engine.catalogSort,
       markArchiveOrgMedia: !!CONFIG.markArchiveOrgMedia,
       mediaDebug: !!CONFIG.mediaDebug, cacheDebug: !!CONFIG.cacheDebug
     });
@@ -4494,6 +4507,12 @@
       if (val === activeDesign) o.selected = true;
       designSel.append(o);
     }
+    const fontSel = el('select', { id: 'wb-font-sel', onchange: (e) => { applyFont(e.target.value); saveSettings(); } });
+    for (const [val, label] of [['2005', '2005'], ['2012', '2012']]) {
+      const o = el('option', { value: val }, label);
+      if (val === activeFont) o.selected = true;
+      fontSel.append(o);
+    }
     const catalogSortSel = el('select', { id: 'wb-catalog-sort', onchange: (e) => {
       engine.catalogSort = normCatalogSort(e.target.value);
       saveSettings();
@@ -4525,6 +4544,7 @@
       el('label', {}, ' speed ', speedSel),
       el('label', {}, ' colors ', colorSel),
       el('label', {}, ' design ', designSel),
+      el('label', {}, ' font ', fontSel),
       el('label', {}, ' catalog ', catalogSortSel),
       pause, hide, iaStars,
       el('span', { id: 'wb-ratelimit' }, ''),
@@ -4990,6 +5010,7 @@
       engine.catalogSort = normCatalogSort(saved.catalogSort);
       applyTheme(saved.theme || saved.colors);
       applyDesign(saved.design);
+      applyFont(saved.font);
     }
     applyIaStarMode();
 
@@ -5190,10 +5211,10 @@
     /* Binary alpha threshold: snaps every text pixel to fully opaque or
        transparent, replicating old Windows GDI bitmap rendering. Applied to
        text containers only so images stay smooth. */
-    .wb-postinfo, .wb-comment, .wb-fileinfo, .wb-omitted,
+    html.wb-font-2005 :is(.wb-postinfo, .wb-comment, .wb-fileinfo, .wb-omitted,
     .wb-nav, .wb-boardtitle, .wb-note,
     #wb-bar, #wb-boardnav, #wb-postform, #wb-rules,
-    .wb-catalog-meta, .wb-catalog-title, .wb-catalog-text {
+    .wb-catalog-meta, .wb-catalog-title, .wb-catalog-text) {
       filter: url(#wb-crunch);
     }
     #wb-overlay a, #wb-overlay a:visited { color:var(--wb-link); text-decoration:none; }
