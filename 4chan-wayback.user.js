@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.9.1
+// @version      0.9.2
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -925,17 +925,22 @@
   }
 
   function gmBlobURL(url) {
-    if (hostIsDown(url)) {
-      mediaDebug('warn', 'fetch skipped, host marked down', { source: mediaSourceKind(url), host: mediaHost(url), url });
-      return Promise.resolve(null);
-    }
     if (_blobCache.has(url)) {
       mediaDebug('debug', 'fetch promise cache hit', { source: mediaSourceKind(url), host: mediaHost(url), url });
       return _blobCache.get(url);
     }
+    let skippedHostDown = false;
     const p = (async () => {
+      // Persistent cache FIRST, host-health check second: a cached blob must
+      // be served even while its host is rate limited or down — the bytes
+      // are already local and don't need the host at all.
       const cached = await cachedMediaBlobURL(url);
       if (cached) return cached;
+      if (hostIsDown(url)) {
+        skippedHostDown = true;
+        mediaDebug('warn', 'fetch skipped, host marked down', { source: mediaSourceKind(url), host: mediaHost(url), url });
+        return null;
+      }
       return new Promise((resolve) => {
         const timeout = mediaFetchTimeout(url);
         mediaDebug('debug', 'fetch start', { source: mediaSourceKind(url), host: mediaHost(url), timeout, url });
@@ -968,6 +973,9 @@
       });
     })();
     _blobCache.set(url, p);
+    // A host-down skip is not a verdict on the URL — drop the memoized null
+    // so the next attempt (after the cooldown) actually tries the network.
+    p.then((v) => { if (!v && skippedHostDown) _blobCache.delete(url); }, () => {});
     return p;
   }
 
@@ -2215,8 +2223,17 @@
     }
     const promise = resolvePostMediaBlob(p, kind).then((r) => {
       if (!r || (kind === 'full' && r.thumbFallback)) _postBlobCache.delete(key);
-      if (r && !(kind === 'full' && r.thumbFallback)) _postBlobResultCache.set(key, r);
-      else _postBlobResultCache.delete(key);
+      if (r && !(kind === 'full' && r.thumbFallback)) {
+        _postBlobResultCache.set(key, r);
+      } else if (!r) {
+        // Session miss memo: a resolve that found nothing must NOT re-run on
+        // every repaint (each run is API calls + searches — the traffic that
+        // gets us rate limited). Memoize null for this session; a reload or
+        // the persistent miss entry below governs retrying later.
+        _postBlobResultCache.set(key, null);
+      } else {
+        _postBlobResultCache.delete(key); // thumb fallback: retry for the full image later
+      }
       if (r && r.url && !(kind === 'full' && r.thumbFallback)) {
         cacheSet(resolvedKey, {
           url: r.url,
