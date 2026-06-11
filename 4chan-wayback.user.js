@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.9.2
+// @version      0.9.3
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -4028,9 +4028,14 @@
       if (p.ts > clk) break;
       if (engine.shownPosts.has(p.num)) continue;
       engine.shownPosts.add(p.num);
-      const node = renderPostNode(p, p.op, { opNum: engine.thread && engine.thread.posts && engine.thread.posts[0] && engine.thread.posts[0].num });
-      wrap.append(node);
-      addBacklinksFor(p); // drop ">>this" onto every post this one quoted
+      // One malformed post must never blank the rest of the thread.
+      try {
+        const node = renderPostNode(p, p.op, { opNum: engine.thread && engine.thread.posts && engine.thread.posts[0] && engine.thread.posts[0].num });
+        wrap.append(node);
+        addBacklinksFor(p); // drop ">>this" onto every post this one quoted
+      } catch (e) {
+        mediaDebug('warn', 'post render failed', { num: p.num, error: String(e && e.message || e) });
+      }
     }
   }
 
@@ -4147,6 +4152,13 @@
         if (!engine.openThread) refreshCurrentBoardSnapshot();
         hydrateCatalog(board, ops);
       }); // ready for "back to index"
+    }
+    // The catalog is an end-of-day snapshot, so it lists threads that start
+    // later than the live replay clock. Opening one of those used to reveal
+    // zero posts — an "empty thread" with no explanation. View it through an
+    // end-of-day clock instead, the same way off-date threads are shown.
+    if (!engine.threadClockOverride && t.posts[0] && t.posts[0].ts > engine.clock) {
+      engine.threadClockOverride = replayEndTs(etDateString(t.posts[0].ts));
     }
     revealThreadPosts();
     updateTitle(); // now that the OP is loaded, use its subject in the tab
