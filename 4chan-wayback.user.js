@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.10.6
+// @version      0.10.7
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -148,6 +148,18 @@
       applyDesign(saved && saved.design);
       applyFont(saved && saved.font);
     }
+  }
+  // Live mode: show the real, present-day 4chan with the script completely
+  // inert — no styles, no overlay, no archive requests, nothing. The only
+  // thing registered is the userscript-menu command that switches back.
+  if (GM_getValue('oldchanLiveMode', false)) {
+    try {
+      GM_registerMenuCommand('ancientchan: return to the time machine', () => {
+        GM_setValue('oldchanLiveMode', false);
+        location.reload();
+      });
+    } catch (e) { /* menu unavailable */ }
+    return;
   }
   ensureStyles();
 
@@ -4589,6 +4601,14 @@
     }
 
     const hide = el('button', { onclick: () => setBarHidden(true) }, 'Hide');
+    const live = el('button', {
+      id: 'wb-live',
+      title: 'Leave the time machine: reload as the real, present-day board with the script fully disabled. Re-enable via the Violentmonkey menu ("return to the time machine").',
+      onclick: () => {
+        GM_setValue('oldchanLiveMode', true);
+        location.href = `https://boards.4chan.org/${engine.board}/`;
+      }
+    }, 'Live');
     const iaStars = el('button', {
       id: 'wb-iastars',
       title: 'Mark images served from the archive.org /mlp/ rehost with a ★',
@@ -4610,7 +4630,7 @@
       el('label', {}, ' design ', designSel),
       el('label', {}, ' font ', fontSel),
       el('label', {}, ' catalog ', catalogSortSel),
-      pause, hide, iaStars,
+      pause, hide, live, iaStars,
       el('span', { id: 'wb-ratelimit' }, ''),
       el('span', { id: 'wb-clock' }, '')
     );
