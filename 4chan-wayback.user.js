@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.10.7
+// @version      0.10.8
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -70,6 +70,38 @@
 
 (function () {
   'use strict';
+
+  // Live mode: show the real, present-day 4chan with the script inert. This
+  // check MUST come before anything else — the early-hide CSS below blanks
+  // the page expecting the overlay to replace it, and in live mode the
+  // overlay never comes (that was the white-screen bug). The only footprints
+  // are a small floating return button and a userscript-menu command.
+  if (GM_getValue('oldchanLiveMode', false)) {
+    const returnToReplay = () => {
+      GM_setValue('oldchanLiveMode', false);
+      location.reload();
+    };
+    try {
+      GM_registerMenuCommand('ancientchan: return to the time machine', returnToReplay);
+    } catch (e) { /* menu unavailable */ }
+    const addReturnButton = () => {
+      if (!document.body || document.getElementById('oldchan-return')) return;
+      const b = document.createElement('button');
+      b.id = 'oldchan-return';
+      b.textContent = 'ancientchan';
+      b.title = 'Return to the time machine';
+      b.style.cssText = 'position:fixed;top:8px;right:8px;z-index:2147483647;' +
+        'font:11px arial,helvetica,sans-serif;padding:3px 9px;cursor:pointer;' +
+        'background:#fffdef;color:#800;border:1px solid #b7c5d9;border-radius:3px;opacity:.85;';
+      b.addEventListener('mouseenter', () => { b.style.opacity = '1'; });
+      b.addEventListener('mouseleave', () => { b.style.opacity = '.85'; });
+      b.addEventListener('click', returnToReplay);
+      document.body.append(b);
+    };
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', addReturnButton);
+    else addReturnButton();
+    return;
+  }
 
   // We replace 4chan's page wholesale, so its own bundles (options/core/…) end up
   // running against a DOM they no longer recognise and throw — e.g. 4chan's
@@ -148,18 +180,6 @@
       applyDesign(saved && saved.design);
       applyFont(saved && saved.font);
     }
-  }
-  // Live mode: show the real, present-day 4chan with the script completely
-  // inert — no styles, no overlay, no archive requests, nothing. The only
-  // thing registered is the userscript-menu command that switches back.
-  if (GM_getValue('oldchanLiveMode', false)) {
-    try {
-      GM_registerMenuCommand('ancientchan: return to the time machine', () => {
-        GM_setValue('oldchanLiveMode', false);
-        location.reload();
-      });
-    } catch (e) { /* menu unavailable */ }
-    return;
   }
   ensureStyles();
 
