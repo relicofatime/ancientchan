@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ancientchan
 // @namespace    4chan-wayback-machine
-// @version      0.10.1
+// @version      0.10.2
 // @description  4chan time machine. Replays archived 4chan boards in real time with era-correct UI. Visit a real 4chan board URL and travel back to a set date; posts stream in at the exact second they were originally posted. Data from FoolFuuka archives (desuarchive / 4plebs / archived.moe).
 // @author       relicofatime
 // @match        *://boards.4chan.org/*
@@ -2757,6 +2757,28 @@
       if (cached && cached.complete && !tinyCatalogOps(cachedOps) && !opts.expand) return ops;
     }
 
+    // Seed from neighboring dates' cached catalogs: the board barely changes
+    // day to day, so a date next to one already browsed starts ~95% full for
+    // free. The scan below then only has to fetch the new day's threads —
+    // the whole catalog is enumerated from the network ONCE per era, ever.
+    {
+      let seeded = 0;
+      for (const dOff of [-1, 1, -2, 2, -3, -4, -5, -6, -7]) {
+        const nKey = catalogCacheKey(board, addDays(date, dOff));
+        const nCached = cacheGet(nKey);
+        const nOps = Array.isArray(nCached) ? nCached : (nCached && Array.isArray(nCached.ops) ? nCached.ops : null);
+        if (!nOps) continue;
+        for (const op of nOps) {
+          if (op && op.num && op.ts <= endClock && !seen.has(String(op.num)) && mergeOp(op)) seeded++;
+        }
+      }
+      if (seeded) {
+        loadCachedThreadSummariesIntoMemory(board, sortedUniqueOps(all));
+        cacheDebug('debug', 'seeded catalog from neighbor dates', { board, date, seeded });
+        emit('neighbor catalog seed');
+      }
+    }
+
     // OPs gathered from per-day OP searches (cheap, paginated HTML that
     // caches forever) so activity threads don't each cost a full thread
     // fetch just to read their OP. Thread fetches remain the fallback for
@@ -3467,14 +3489,32 @@
           useResolvedMedia(full, 'full');
           window.open(full.url, '_blank', 'noopener');
         } else if (fileLink.getAttribute('href') !== 'javascript:void(0)') {
+          if (!full) { img.dataset.fullMissing = '1'; noteFullMissing(); }
           window.open(fileLink.href, '_blank', 'noopener');
+        } else if (!full) {
+          img.dataset.fullMissing = '1';
+          noteFullMissing();
         }
       });
       // Click-to-expand works the same on the index and inside a thread.
       let expanded = false;
+      // After a full-size hunt comes up empty, say so once next to the file
+      // info and stop re-hunting — later clicks just toggle the enlarged
+      // thumbnail, which is all that survives.
+      const noteFullMissing = () => {
+        if (fileInfo.querySelector('.wb-fullmissing')) return;
+        fileInfo.append(el('span', { class: 'wb-fullmissing' },
+          ' — full size lost, only the thumbnail survives'));
+      };
       img.addEventListener('click', async (e) => {
         e.preventDefault();
         if (img.dataset.placeholder === '1') return;
+        if (img.dataset.fullMissing === '1') {
+          expanded = !expanded;
+          img.classList.toggle('wb-expanded', expanded);
+          img.classList.toggle('wb-thumb-fallback', expanded);
+          return;
+        }
         if (!expanded) {
           expanded = true;
           img.classList.add('wb-expanded', 'wb-thumb-fallback');
@@ -3489,6 +3529,9 @@
           if (expanded && full && img.isConnected && img.dataset.placeholder !== '1') {
             useResolvedMedia(full, 'full');
             img.classList.toggle('wb-thumb-fallback', full.thumbFallback);
+          } else if (!full && img.isConnected && img.dataset.placeholder !== '1') {
+            img.dataset.fullMissing = '1';
+            noteFullMissing();
           }
         } else if (expanded) {
           expanded = false;
@@ -5254,6 +5297,7 @@
     .wb-omitted { display:block; color:var(--wb-dim); margin:2px 0 2px 20px; }
     .wb-threadicon { vertical-align:text-bottom; margin:0 1px; }
     .wb-pagebtn { font-size:11px; }
+    .wb-fullmissing { color:var(--wb-dim); font-style:italic; font-size:11px; }
     .wb-previews { }
     .wb-previewrow { margin:0; }
     .wb-file { display:block; }
